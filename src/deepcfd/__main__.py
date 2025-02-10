@@ -11,9 +11,16 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset
 from torch.autograd import Variable
 
-
+# changed to mps from cuda 
 def parseOpts(argv):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Check for MPS availability
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+        
     net= "UNetEx"
     kernel_size = 5
     filters = [8, 16, 32, 32]
@@ -70,8 +77,12 @@ def parseOpts(argv):
             )
             sys.exit()
         elif opt in ("-d", "--device"):
-            if (arg == "cpu" or arg.startswith("cuda")):
-                device = arg;
+            if arg == "mps" and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            elif arg == "cpu":
+                device = torch.device("cpu")
+            elif arg.startswith("cuda") and torch.cuda.is_available():
+                device = torch.device(arg)
             else:
                 print("Unkown device " + str(arg) + ", only 'cpu', 'cuda'"
                     "'cuda:index', or comma-separated list of 'cuda:index'"
@@ -151,6 +162,10 @@ def main():
     batch = x.shape[0]
     nx = x.shape[2]
     ny = x.shape[3]
+    
+    # When loading data, move it to device:
+    x = torch.FloatTensor(x).to(options["device"])
+    y = torch.FloatTensor(y).to(options["device"])
 
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1).to(options["device"])
@@ -174,7 +189,8 @@ def main():
         kernel_size=options["kernel_size"],
         batch_norm=False,
         weight_norm=False
-    )
+    ).to(options["device"])  # Make sure to move model to device
+
 
     # Define optimizer
     optimizer = torch.optim.AdamW(
