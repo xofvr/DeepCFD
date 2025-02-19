@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 from .AutoEncoder import create_layer
-
+from ..MPS_Utilities import custom_max_unpool2d, safe_max_pool2d_with_indices
 
 def create_encoder_block(in_channels, out_channels, kernel_size, wn=True, bn=True,
                  activation=nn.ReLU, layers=2):
@@ -15,7 +15,6 @@ def create_encoder_block(in_channels, out_channels, kernel_size, wn=True, bn=Tru
             _in = in_channels
         encoder.append(create_layer(_in, _out, kernel_size, wn, bn, activation, nn.Conv2d))
     return nn.Sequential(*encoder)
-
 
 def create_decoder_block(in_channels, out_channels, kernel_size, wn=True, bn=True,
                  activation=nn.ReLU, layers=2, final_layer=False):
@@ -35,7 +34,6 @@ def create_decoder_block(in_channels, out_channels, kernel_size, wn=True, bn=Tru
         decoder.append(create_layer(_in, _out, kernel_size, wn, _bn, _activation, nn.ConvTranspose2d))
     return nn.Sequential(*decoder)
 
-
 def create_encoder(in_channels, filters, kernel_size, wn=True, bn=True, activation=nn.ReLU, layers=2):
     encoder = []
     for i in range(len(filters)):
@@ -46,7 +44,6 @@ def create_encoder(in_channels, filters, kernel_size, wn=True, bn=True, activati
         encoder = encoder + [encoder_layer]
     return nn.Sequential(*encoder)
 
-
 def create_decoder(out_channels, filters, kernel_size, wn=True, bn=True, activation=nn.ReLU, layers=2):
     decoder = []
     for i in range(len(filters)):
@@ -56,7 +53,6 @@ def create_decoder(out_channels, filters, kernel_size, wn=True, bn=True, activat
             decoder_layer = create_decoder_block(filters[i], filters[i-1], kernel_size, wn, bn, activation, layers, final_layer=False)
         decoder = [decoder_layer] + decoder
     return nn.Sequential(*decoder)
-
 
 class UNetEx(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, filters=[16, 32, 64], layers=3,
@@ -78,7 +74,7 @@ class UNetEx(nn.Module):
             x = encoder(x)
             sizes.append(x.size())
             tensors.append(x)
-            x, ind = F.max_pool2d(x, 2, 2, return_indices=True)
+            x, ind = safe_max_pool2d_with_indices(x, 2, 2)
             indices.append(ind)
         return x, tensors, indices, sizes
 
@@ -93,7 +89,10 @@ class UNetEx(nn.Module):
                 tensor = tensors.pop()
                 size = sizes.pop()
                 ind = indices.pop()
-                x = F.max_unpool2d(x, ind, 2, 2, output_size=size)
+                if x.device.type == 'mps':
+                    x = custom_max_unpool2d(x, ind, 2, 2, output_size=size[2:])
+                else:
+                    x = F.max_unpool2d(x, ind, kernel_size=2, stride=2, output_size=size[2:])
                 x = torch.cat([tensor, x], dim=1)
                 x = decoder(x)
             y.append(x)
