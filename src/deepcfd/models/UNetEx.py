@@ -89,7 +89,10 @@ class UNetEx(nn.Module):
                 tensor = tensors.pop()
                 size = sizes.pop()
                 ind = indices.pop()
-                x = custom_max_unpool2d(x, ind, 2, 2, output_size=size[2:])
+                if x.device.type == 'mps':
+                    x = custom_max_unpool2d(x, ind, 2, 2, output_size=size[2:])
+                else:
+                    x = F.max_unpool2d(x, ind, kernel_size=2, stride=2, output_size=size[2:])
                 x = torch.cat([tensor, x], dim=1)
                 x = decoder(x)
             y.append(x)
