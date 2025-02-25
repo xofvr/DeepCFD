@@ -13,10 +13,7 @@ from torch.autograd import Variable
 
 # changed to mps from cuda 
 def parseOpts(argv):
-    # Check for MPS availability
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
@@ -60,7 +57,7 @@ def parseOpts(argv):
         if opt == '-h' or opt == '--help':
             print("deepcfd "
                 "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', (default: cuda if available)"
-                "\n    -n  <net> network architecture: UNet, UNetEx or "
+                "\n    -n  <net> network architecture: UNet, or "
                     "AutoEncoder (default: UNetEx)"
                 "\n    -mi <model-input>  input dataset with sdf1,"
                     "flow-region and sdf2 fields (default: dataX.pkl)"
@@ -74,6 +71,8 @@ def parseOpts(argv):
                 "\n    -b <batch-size>  training batch size (default: 32)"
                 "\n    -p <patience>  number of epochs for early stopping (default: 300)"
                 "\n    -v <visualize> flag for visualizing ground-truth vs prediction plots (default: False)\n"
+                "\n    -n <net> network architecture: UNet, UNetEx, "
+                    "TransformerUNetEx or AutoEncoder (default: UNetEx)"
             )
             sys.exit()
         elif opt in ("-d", "--device"):
@@ -162,13 +161,9 @@ def main():
     batch = x.shape[0]
     nx = x.shape[2]
     ny = x.shape[3]
-    
-    # When loading data, move it to device:
-    x = torch.FloatTensor(x).to(options["device"])
-    y = torch.FloatTensor(y).to(options["device"])
 
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
-        .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1).to(options["device"])
+        .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
 
     dirname = os.path.dirname(os.path.abspath(options["output"]))
     if dirname and not os.path.exists(dirname):
@@ -189,7 +184,7 @@ def main():
         kernel_size=options["kernel_size"],
         batch_norm=False,
         weight_norm=False
-    ).to(options["device"])  # Make sure to move model to device
+    ) 
 
 
     # Define optimizer
