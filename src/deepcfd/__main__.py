@@ -153,8 +153,13 @@ def main():
     # Shuffle the data
     indices = list(range(len(x)))
     random.shuffle(indices)
-    x = x[indices][250]
-    y = y[indices][250]
+    
+    # Select only 300 samples randomly
+    if len(indices) > 300:
+        indices = indices[:300]
+      
+    x = x[indices]
+    y = y[indices]
 
     x = torch.FloatTensor(x)
     y = torch.FloatTensor(y)
