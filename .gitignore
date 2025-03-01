@@ -16,3 +16,10 @@ BestRun/
 _Results/
 
 .DS_Store
+
+**.pt
+
+deepcfd.egg-info/
+
+checkpoint*
+
