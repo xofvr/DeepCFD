@@ -89,10 +89,7 @@ def parseOpts(argv):
                     "are supported")
                 exit(0)
         elif opt in ("-n", "--net"):
-            if (arg == "UNet"):
-                from .models.UNet import UNet
-                net = UNet
-            elif (arg == "UNetEx"):
+            if (arg == "UNetEx"):
                 from .models.UNetEx import UNetEx
                 net = UNetEx
             elif (arg == "TransformerUNetEx"):
