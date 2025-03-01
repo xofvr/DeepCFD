@@ -10,6 +10,7 @@ from .functions import *
 import torch.optim as optim
 from torch.utils.data import TensorDataset
 from torch.autograd import Variable
+from .models.TransformerUNetEx import TransformerUNetEx
 
 # changed to mps from cuda 
 def parseOpts(argv):
@@ -57,8 +58,8 @@ def parseOpts(argv):
         if opt == '-h' or opt == '--help':
             print("deepcfd "
                 "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', (default: cuda if available)"
-                "\n    -n  <net> network architecture: UNet, or "
-                    "AutoEncoder (default: UNetEx)"
+                "\n    -n  <net> network architecture: UNet, UNetEx, "
+                    "TransformerUNetEx or AutoEncoder (default: UNetEx)"
                 "\n    -mi <model-input>  input dataset with sdf1,"
                     "flow-region and sdf2 fields (default: dataX.pkl)"
                 "\n    -mo <model-output>  output dataset with Ux,"
@@ -94,6 +95,9 @@ def parseOpts(argv):
             elif (arg == "UNetEx"):
                 from .models.UNetEx import UNetEx
                 net = UNetEx
+            elif (arg == "TransformerUNetEx"):
+                net = TransformerUNetEx
+
             elif (arg == "AutoEncoder"):
                 from .models.AutoEncoder import AutoEncoder
                 net = AutoEncoder
@@ -152,8 +156,8 @@ def main():
     # Shuffle the data
     indices = list(range(len(x)))
     random.shuffle(indices)
-    x = x[indices]
-    y = y[indices]
+    x = x[indices][250]
+    y = y[indices][250]
 
     x = torch.FloatTensor(x)
     y = torch.FloatTensor(y)
