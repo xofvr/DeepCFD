@@ -14,8 +14,11 @@ from .models.TransformerUNetEx import TransformerUNetEx
 
 # changed to mps from cuda 
 def parseOpts(argv):
+    
     if torch.cuda.is_available():
         device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
         device = torch.device("cpu")
         
@@ -89,6 +92,7 @@ def parseOpts(argv):
                     "are supported")
                 exit(0)
         elif opt in ("-n", "--net"):
+
             if (arg == "UNetEx"):
                 from .models.UNetEx import UNetEx
                 net = UNetEx
@@ -153,11 +157,6 @@ def main():
     # Shuffle the data
     indices = list(range(len(x)))
     random.shuffle(indices)
-    
-    # Select only 300 samples randomly
-    if len(indices) > 300:
-        indices = indices[:300]
-      
     x = x[indices]
     y = y[indices]
 
