@@ -110,6 +110,8 @@ class TransformerUNetEx(UNetEx):
         if self.pos_encoder is None or self.pos_encoder.pe.size(0) != height * width:
             self.pos_encoder = PositionalEncoding2D(self.transformer_dim, height, width)
             # Move to the same device as x
+            self.pos_encoder = self.pos_encoder.to(x.device)
+            # Move to the same device as x
             if x.device.type == 'mps':
                 self.pos_encoder = to_device(self.pos_encoder, x.device)
             else:

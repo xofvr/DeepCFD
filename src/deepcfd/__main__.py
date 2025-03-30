@@ -10,7 +10,6 @@ from .functions import *
 import torch.optim as optim
 from torch.utils.data import TensorDataset
 from torch.autograd import Variable
-from .models.TransformerUNetEx import TransformerUNetEx
 
 # changed to mps from cuda 
 def parseOpts(argv):
@@ -97,6 +96,7 @@ def parseOpts(argv):
                 from .models.UNetEx import UNetEx
                 net = UNetEx
             elif (arg == "TransformerUNetEx"):
+                from .models.TransformerUNetEx import TransformerUNetEx
                 net = TransformerUNetEx
 
             elif (arg == "AutoEncoder"):
@@ -170,6 +170,8 @@ def main():
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
 
+    channels_weights = channels_weights.to(options["device"])
+
     dirname = os.path.dirname(os.path.abspath(options["output"]))
     if dirname and not os.path.exists(dirname):
        os.makedirs(dirname, exist_ok=True)
@@ -225,6 +227,9 @@ def main():
 
     def loss_func(model, batch):
         x, y = batch
+        # Make sure inputs are on the same device as the model
+        x = x.to(options["device"])
+        y = y.to(options["device"])
         output = model(x)
         lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
@@ -232,10 +237,10 @@ def main():
             (output.shape[0],1,output.shape[2],output.shape[3]))
         lossp = torch.abs((output[:,2,:,:] - y[:,2,:,:])).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
-        loss = (lossu + lossv + lossp)/channels_weights
+        # Make sure channels_weights is on the same device as loss tensors
+        loss = (lossu + lossv + lossp)/channels_weights.to(output.device)
 
         return torch.sum(loss), output
-
     # Training model
     DeepCFD, train_metrics, train_loss, test_metrics, test_loss = train_model(
         model,
