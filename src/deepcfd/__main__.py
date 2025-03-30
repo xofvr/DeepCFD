@@ -123,7 +123,7 @@ def parseOpts(argv):
         elif opt in ("-o", "--output"):
             output = arg
         elif opt in ("-p", "--patience"):
-            patience = arg
+            patience = int(arg)
         elif opt in ("-v", "--visualize"):
             visualize = True
 
