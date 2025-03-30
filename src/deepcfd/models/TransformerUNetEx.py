@@ -41,6 +41,26 @@ class PositionalEncoding2D(nn.Module):
         """
         return x + self.pe[:x.size(0), :]
 
+class LayerNormConv2d(nn.Module):
+    """
+    Conv2d with LayerNorm instead of BatchNorm
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1):
+        super(LayerNormConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, 
+                            padding=padding, stride=stride)
+        # Layer norm normalizes over the channel dimension
+        self.norm = nn.LayerNorm(out_channels)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        # Rearrange for layer norm: [B, C, H, W] -> [B, H, W, C]
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        # Back to [B, C, H, W]
+        x = x.permute(0, 3, 1, 2)
+        return x
+
 class TransformerUNetEx(UNetEx):
     """
     Extended UNet architecture with a Transformer module in the bottleneck.
@@ -50,6 +70,7 @@ class TransformerUNetEx(UNetEx):
     def __init__(self, in_channels, out_channels, kernel_size=3, filters=[16, 32, 64], layers=3,
                  weight_norm=True, batch_norm=True, activation=nn.ReLU, final_activation=None,
                  transformer_dim=512, nhead=8, num_layers=6):
+        
         """
         Args:
             in_channels: Number of input channels
@@ -73,19 +94,26 @@ class TransformerUNetEx(UNetEx):
         
         self.transformer_dim = transformer_dim
         
-        # Add a projection layer to adjust dimensions for transformer
-        self.to_transformer_dim = nn.Conv2d(filters[-1], transformer_dim, kernel_size=1)
+        # Replace Conv2d with LayerNormConv2d for transformer-related layers
+        self.to_transformer_dim = LayerNormConv2d(filters[-1], transformer_dim, kernel_size=1, padding=0)
         
         # Positional encoding (will be initialized in forward pass with actual feature map size)
         self.pos_encoder = None
         
-        # Add transformer encoder layers
-        encoder_layer = TransformerEncoderLayer(d_model=transformer_dim, nhead=nhead, 
-                                              dim_feedforward=transformer_dim * 4, dropout=0.1)
+        # Use Layer Normalization in the transformer layers
+        encoder_layer = TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=nhead,
+            dim_feedforward=transformer_dim * 4,
+            dropout=0.1,
+            activation='relu',
+            # Layer normalization is used by default in PyTorch's TransformerEncoderLayer
+            # so no need to specify it explicitly
+        )
         self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Add projection back to original dimension
-        self.from_transformer_dim = nn.Conv2d(transformer_dim, filters[-1], kernel_size=1)
+        # Use LayerNormConv2d for the projection back as well
+        self.from_transformer_dim = LayerNormConv2d(transformer_dim, filters[-1], kernel_size=1, padding=0)
         
     def forward(self, x):
         """

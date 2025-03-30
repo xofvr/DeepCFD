@@ -10,6 +10,8 @@ from .functions import *
 import torch.optim as optim
 from torch.utils.data import TensorDataset
 from torch.autograd import Variable
+from .lr_scheduler import TransformerLRScheduler
+from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
 
 # changed to mps from cuda 
 def parseOpts(argv):
@@ -181,7 +183,7 @@ def main():
     
     train_dataset, test_dataset = TensorDataset(*train_data), TensorDataset(*test_data)
     test_x, test_y = test_dataset[:]
-
+    
     torch.manual_seed(0)
 
     model = options["net"](
@@ -199,6 +201,15 @@ def main():
         model.parameters(),
         lr=options["learning_rate"],
         weight_decay=0.005
+    )
+    
+    warmup_steps = int(0.1 * options["epochs"])  # 10% of total epochs for warmup
+    scheduler = TransformerLRScheduler(
+        optimizer, 
+        warmup_steps=warmup_steps,
+        max_steps=options["epochs"],
+        min_lr=1e-7,
+        warmup_init_lr=1e-7
     )
 
     config = {}        
@@ -248,6 +259,7 @@ def main():
         train_dataset,
         test_dataset,
         optimizer,
+        scheduler=scheduler,
         epochs=options["epochs"],
         batch_size=options["batch_size"],
         device=options["device"],
