@@ -7,7 +7,7 @@ class TransformerLRScheduler(_LRScheduler):
     Learning rate scheduler with warmup phase specifically designed for transformer models.
     Implements a warmup period followed by cosine decay.
     """
-    def __init__(self, optimizer, warmup_steps, max_steps, min_lr=1e-7, warmup_init_lr=1e-7, last_epoch=-1):
+    def __init__(self, optimizer, warmup_steps, max_steps, min_lr=1e-6, warmup_init_lr=1e-4, last_epoch=-1):
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
         self.min_lr = min_lr

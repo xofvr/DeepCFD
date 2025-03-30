@@ -42,25 +42,23 @@ class PositionalEncoding2D(nn.Module):
         return x + self.pe[:x.size(0), :]
 
 class LayerNormConv2d(nn.Module):
-    """
-    Conv2d with LayerNorm instead of BatchNorm
-    """
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1):
         super(LayerNormConv2d, self).__init__()
+        # Layer norm first, normalizing over the channel dimension
+        self.norm = nn.LayerNorm(in_channels)
+        # Then convolution
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, 
                             padding=padding, stride=stride)
-        # Layer norm normalizes over the channel dimension
-        self.norm = nn.LayerNorm(out_channels)
         
     def forward(self, x):
-        x = self.conv(x)
-        # Rearrange for layer norm: [B, C, H, W] -> [B, H, W, C]
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
+        # [B, C, H, W] -> [B, H, W, C]
+        x_transposed = x.permute(0, 2, 3, 1)
+        x_normalized = self.norm(x_transposed)
         # Back to [B, C, H, W]
-        x = x.permute(0, 3, 1, 2)
-        return x
-
+        x = x_normalized.permute(0, 3, 1, 2)
+        # Then apply convolution
+        return self.conv(x)
+    
 class TransformerUNetEx(UNetEx):
     """
     Extended UNet architecture with a Transformer module in the bottleneck.
@@ -69,8 +67,7 @@ class TransformerUNetEx(UNetEx):
     """
     def __init__(self, in_channels, out_channels, kernel_size=3, filters=[16, 32, 64], layers=3,
                  weight_norm=True, batch_norm=True, activation=nn.ReLU, final_activation=None,
-                 transformer_dim=512, nhead=8, num_layers=6):
-        
+                 transformer_dim=128, nhead=4, num_layers=2): 
         """
         Args:
             in_channels: Number of input channels
@@ -115,6 +112,8 @@ class TransformerUNetEx(UNetEx):
         # Use LayerNormConv2d for the projection back as well
         self.from_transformer_dim = LayerNormConv2d(transformer_dim, filters[-1], kernel_size=1, padding=0)
         
+        self.residual_alpha = nn.Parameter(torch.tensor(0.2))
+        
     def forward(self, x):
         """
         Forward pass through the TransformerUNetEx model.
@@ -133,6 +132,8 @@ class TransformerUNetEx(UNetEx):
         
         # Project to transformer dimension
         x_proj = self.to_transformer_dim(x)
+        
+        transformer_input = x.clone()
         
         # Create positional encoding if not already created or if dimensions changed
         if self.pos_encoder is None or self.pos_encoder.pe.size(0) != height * width:
@@ -166,5 +167,7 @@ class TransformerUNetEx(UNetEx):
         # Apply final activation if specified
         if self.final_activation is not None:
             x = self.final_activation(x)
+        
+        x = self.from_transformer_dim(x_transformed) + self.residual_alpha * transformer_input
             
         return x
