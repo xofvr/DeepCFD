@@ -1,7 +1,7 @@
 import copy
 import torch
 from .pytorchtools import EarlyStopping
-
+from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
 
 def generate_metrics_list(metrics_def):
     list = {}
@@ -10,7 +10,7 @@ def generate_metrics_list(metrics_def):
     return list
 
 
-def epoch(scope, loader, on_batch=None, training=False):
+def epoch(scope, loader, on_batch=None, training=False, max_grad_norm=1.0):
     model = scope["model"]
     optimizer = scope["optimizer"]
     loss_func = scope["loss_func"]
@@ -33,6 +33,8 @@ def epoch(scope, loader, on_batch=None, training=False):
         if training:
             optimizer.zero_grad()
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
         total_loss += loss.item()
         scope["batch"] = tensors
@@ -54,7 +56,8 @@ def epoch(scope, loader, on_batch=None, training=False):
 
 
 def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_function=print, eval_model=None,
-          on_train_batch=None, on_val_batch=None, on_train_epoch=None, on_val_epoch=None, after_epoch=None):
+          on_train_batch=None, on_val_batch=None, on_train_epoch=None, on_val_epoch=None, after_epoch=None, 
+          scheduler=None, max_grad_norm=1.0):
 
     early_stopping = EarlyStopping(patience, verbose=True)
 
@@ -68,6 +71,13 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
     scope["best_val_metrics"] = None
     scope["best_val_loss"] = float("inf")
     scope["best_model"] = None
+    
+    augmentation = FluidDataAugmentation(
+        flip_prob=0.3, 
+        rotate_prob=0.3,
+        noise_prob=0.2,
+        noise_level=0.02
+    )
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -77,7 +87,7 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
         print_function("Epoch #" + str(epoch_id), flush=True)
         # Training
         scope["dataset"] = train_dataset
-        train_loss, train_metrics = epoch(scope, train_loader, on_train_batch, training=True)
+        train_loss, train_metrics = epoch(scope, train_loader, on_train_batch, training=True, max_grad_norm=max_grad_norm)
         scope["train_loss"] = train_loss
         scope["train_metrics"] = train_metrics
         print_function("\tTrain Loss = " + str(train_loss), flush=True)
@@ -86,6 +96,10 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
         if on_train_epoch is not None:
             on_train_epoch(scope)
         del scope["dataset"]
+        # Step the scheduler after training phase but before validation
+        if scheduler is not None:
+            scheduler.step()
+            print_function(f"\tLearning rate: {scheduler.get_lr()[0]:.7f}", flush=True)
         # Validation
         scope["dataset"] = val_dataset
         with torch.no_grad():
@@ -127,7 +141,7 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
 
 def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process_batch=None, eval_model=None,
                 on_train_batch=None, on_val_batch=None, on_train_epoch=None, on_val_epoch=None, after_epoch=None,
-                epochs=100, batch_size=256, patience=10, device=0, **kwargs):
+                epochs=100, batch_size=256, patience=10, device=0, scheduler=None, max_grad_norm=1.0, **kwargs):
     model = model.to(device)
     scope = {}
     scope["model"] = model
@@ -139,6 +153,7 @@ def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process
     scope["epochs"] = epochs
     scope["batch_size"] = batch_size
     scope["device"] = device
+    scope["scheduler"] = scheduler
     metrics_def = {}
     names = []
     for key in kwargs.keys():
@@ -158,4 +173,4 @@ def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process
     scope["metrics_def"] = metrics_def
     return train(scope, train_dataset, val_dataset, eval_model=eval_model, on_train_batch=on_train_batch,
            on_val_batch=on_val_batch, on_train_epoch=on_train_epoch, on_val_epoch=on_val_epoch, after_epoch=after_epoch,
-           batch_size=batch_size, patience=patience)
+           batch_size=batch_size, patience=patience, scheduler=scheduler, max_grad_norm=max_grad_norm)

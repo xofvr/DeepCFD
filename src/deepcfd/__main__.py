@@ -10,6 +10,8 @@ from .functions import *
 import torch.optim as optim
 from torch.utils.data import TensorDataset
 from torch.autograd import Variable
+from .lr_scheduler import TransformerLRScheduler
+from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
 
 # changed to mps from cuda 
 def parseOpts(argv):
@@ -181,7 +183,7 @@ def main():
     
     train_dataset, test_dataset = TensorDataset(*train_data), TensorDataset(*test_data)
     test_x, test_y = test_dataset[:]
-
+    
     torch.manual_seed(0)
 
     model = options["net"](
@@ -199,6 +201,17 @@ def main():
         model.parameters(),
         lr=options["learning_rate"],
         weight_decay=0.005
+    )
+    
+    # Much fewer warmup steps
+    warmup_steps = int(0.02 * options["epochs"])  # Reduce from 10% to 2%
+    # Higher starting learning rate
+    scheduler = TransformerLRScheduler(
+        optimizer, 
+        warmup_steps=warmup_steps,
+        max_steps=options["epochs"],
+        min_lr=1e-6,  # Slightly higher min LR
+        warmup_init_lr=1e-4  # Start ~100x higher
     )
 
     config = {}        
@@ -227,20 +240,24 @@ def main():
 
     def loss_func(model, batch):
         x, y = batch
-        # Make sure inputs are on the same device as the model
         x = x.to(options["device"])
         y = y.to(options["device"])
         output = model(x)
+        
+        # Keep the original reshape pattern
         lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
         lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
         lossp = torch.abs((output[:,2,:,:] - y[:,2,:,:])).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
-        # Make sure channels_weights is on the same device as loss tensors
-        loss = (lossu + lossv + lossp)/channels_weights.to(output.device)
-
-        return torch.sum(loss), output
+        
+        # Use channel weights as before, but add importance weighting
+        # This preserves the original scaling while emphasizing components differently
+        weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / channels_weights.to(output.device)
+        
+        return torch.sum(weighted_loss), output
+    
     # Training model
     DeepCFD, train_metrics, train_loss, test_metrics, test_loss = train_model(
         model,
@@ -248,6 +265,7 @@ def main():
         train_dataset,
         test_dataset,
         optimizer,
+        scheduler=scheduler,
         epochs=options["epochs"],
         batch_size=options["batch_size"],
         device=options["device"],
