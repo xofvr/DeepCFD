@@ -1,26 +1,35 @@
-
+# IDE files
 .idea/
-
-*.pkl
-
-.ipynb_checkpoints/
-
-__pycache__/
-
-*.txt
-
-Results/
-
-BestRun/
-
-_Results/
-
+.vscode/
 .DS_Store
 
-**.pt
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.ipynb_checkpoints/
 
-deepcfd.egg-info/
+# Distribution / packaging
+.eggs/
+*.egg-info/
+*.egg
 
-checkpoint*
+# Data files
+*.pkl
 
-src/deepcfd.egg-info/
+# Model checkpoints and logs
+*.pt
+checkpoint*/
+
+# Results and output directories
+Results/
+BestRun/
+_Results/
+
+# Log files
+*.txt
+
+# Documentation files (if needed)
+DeepCFD.md

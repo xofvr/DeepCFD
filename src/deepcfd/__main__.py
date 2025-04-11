@@ -12,6 +12,7 @@ from torch.utils.data import TensorDataset
 from torch.autograd import Variable
 from .lr_scheduler import TransformerLRScheduler
 from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
+from .config import DeepCFDConfig
 
 # changed to mps from cuda 
 def parseOpts(argv):
@@ -151,8 +152,16 @@ def parseOpts(argv):
     return options
 
 def main():
-    options = parseOpts(sys.argv[1:])
+    # Parse command-line arguments using the new config system
+    config = DeepCFDConfig()
+    options = config.parse_args(sys.argv[1:])
+    
+    # Save the configuration for reproducibility
+    config_filename = os.path.splitext(options["output"])[0] + "_config.json"
+    config.save_to_json(config_filename)
+    print(f"Configuration saved to {config_filename}")
 
+    # Load data
     x = pickle.load(open(options["model_input"], "rb"))
     y = pickle.load(open(options["model_output"], "rb"))
 
@@ -169,82 +178,125 @@ def main():
     nx = x.shape[2]
     ny = x.shape[3]
 
+    # Calculate the weights for each channel based on their magnitude
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
-
     channels_weights = channels_weights.to(options["device"])
 
+    # Ensure output directory exists
     dirname = os.path.dirname(os.path.abspath(options["output"]))
     if dirname and not os.path.exists(dirname):
        os.makedirs(dirname, exist_ok=True)
 
-    # Spliting dataset into 70% train and 30% test
+    # Split dataset into 70% train and 30% test
     train_data, test_data = split_tensors(x, y, ratio=0.7)
     
+    # Create datasets
     train_dataset, test_dataset = TensorDataset(*train_data), TensorDataset(*test_data)
+    
+    # Set up data augmentation if requested
+    if config.use_augmentation:
+        print("Using data augmentation")
+        augmentation = FluidDataAugmentation(
+            flip_prob=config.aug_flip_prob,
+            rotate_prob=config.aug_rotate_prob,
+            noise_prob=config.aug_noise_prob
+        )
+        train_loader = create_augmented_dataloader(
+            train_dataset, 
+            batch_size=options["batch_size"], 
+            shuffle=True,
+            augmentation=augmentation,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+    else:
+        train_loader = create_augmented_dataloader(
+            train_dataset, 
+            batch_size=options["batch_size"], 
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+    
+    # Get a sample for testing
     test_x, test_y = test_dataset[:]
     
+    # Set reproducible seed
     torch.manual_seed(0)
 
-    model = options["net"](
-        3,
-        3,
-        filters=options["filters"],
-        kernel_size=options["kernel_size"],
-        batch_norm=False,
-        weight_norm=False
-    ) 
-
+    # Initialize model based on the selected architecture
+    model_args = {
+        'in_channels': 3,
+        'out_channels': 3,
+        'filters': options["filters"],
+        'kernel_size': options["kernel_size"],
+        'batch_norm': config.use_batch_norm,
+        'weight_norm': config.use_weight_norm
+    }
+    
+    # Add transformer-specific parameters if using TransformerUNetEx
+    if options["net"] == "TransformerUNetEx":
+        model_args.update({
+            'transformer_dim': config.transformer_dim,
+            'nhead': config.nhead,
+            'num_layers': config.num_layers
+        })
+        
+    model = options["net_class"](**model_args)
 
     # Define optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=options["learning_rate"],
-        weight_decay=0.005
+        weight_decay=config.weight_decay
     )
     
-    # Much fewer warmup steps
-    warmup_steps = int(0.02 * options["epochs"])  # Reduce from 10% to 2%
-    # Higher starting learning rate
+    # Configure learning rate scheduler
+    warmup_steps = int(0.02 * options["epochs"])  # 2% of total epochs for warmup
     scheduler = TransformerLRScheduler(
         optimizer, 
         warmup_steps=warmup_steps,
         max_steps=options["epochs"],
-        min_lr=1e-6,  # Slightly higher min LR
-        warmup_init_lr=1e-4  # Start ~100x higher
+        min_lr=1e-6,
+        warmup_init_lr=1e-4
     )
 
-    config = {}        
-    train_loss_curve = []
-    test_loss_curve = []
-    train_mse_curve = []
-    test_mse_curve = []
-    train_ux_curve = []
-    test_ux_curve = []
-    train_uy_curve = []
-    test_uy_curve = []
-    train_p_curve = []
-    test_p_curve = []
+    # Initialize metrics tracking
+    metrics = {
+        'train_loss_curve': [],
+        'test_loss_curve': [],
+        'train_mse_curve': [],
+        'test_mse_curve': [],
+        'train_ux_curve': [],
+        'test_ux_curve': [],
+        'train_uy_curve': [],
+        'test_uy_curve': [],
+        'train_p_curve': [],
+        'test_p_curve': []
+    }
     
     def after_epoch(scope):
-        train_loss_curve.append(scope["train_loss"])
-        test_loss_curve.append(scope["val_loss"])
-        train_mse_curve.append(scope["train_metrics"]["mse"])
-        test_mse_curve.append(scope["val_metrics"]["mse"])
-        train_ux_curve.append(scope["train_metrics"]["ux"])
-        test_ux_curve.append(scope["val_metrics"]["ux"])
-        train_uy_curve.append(scope["train_metrics"]["uy"])
-        test_uy_curve.append(scope["val_metrics"]["uy"])
-        train_p_curve.append(scope["train_metrics"]["p"])
-        test_p_curve.append(scope["val_metrics"]["p"])
+        """Callback function after each epoch to track metrics"""
+        metrics['train_loss_curve'].append(scope["train_loss"])
+        metrics['test_loss_curve'].append(scope["val_loss"])
+        metrics['train_mse_curve'].append(scope["train_metrics"]["mse"])
+        metrics['test_mse_curve'].append(scope["val_metrics"]["mse"])
+        metrics['train_ux_curve'].append(scope["train_metrics"]["ux"])
+        metrics['test_ux_curve'].append(scope["val_metrics"]["ux"])
+        metrics['train_uy_curve'].append(scope["train_metrics"]["uy"])
+        metrics['test_uy_curve'].append(scope["val_metrics"]["uy"])
+        metrics['train_p_curve'].append(scope["train_metrics"]["p"])
+        metrics['test_p_curve'].append(scope["val_metrics"]["p"])
 
     def loss_func(model, batch):
+        """Custom loss function with component weighting"""
         x, y = batch
         x = x.to(options["device"])
         y = y.to(options["device"])
         output = model(x)
         
-        # Keep the original reshape pattern
+        # Calculate component-wise loss
         lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
         lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).reshape(
@@ -252,13 +304,12 @@ def main():
         lossp = torch.abs((output[:,2,:,:] - y[:,2,:,:])).reshape(
             (output.shape[0],1,output.shape[2],output.shape[3]))
         
-        # Use channel weights as before, but add importance weighting
-        # This preserves the original scaling while emphasizing components differently
+        # Apply component importance weighting
         weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / channels_weights.to(output.device)
         
         return torch.sum(weighted_loss), output
     
-    # Training model
+    # Train the model
     DeepCFD, train_metrics, train_loss, test_metrics, test_loss = train_model(
         model,
         loss_func,
@@ -295,24 +346,52 @@ def main():
             len(scope["dataset"]), patience=options["patience"], after_epoch=after_epoch
     )
 
+    # Save model with metadata
     state_dict = DeepCFD.state_dict()
     state_dict["input_shape"] = (1, 3, nx, ny)
     state_dict["filters"] = options["filters"]
     state_dict["kernel_size"] = options["kernel_size"]
     state_dict["architecture"] = options["net"]
     
+    # For transformer models, save additional parameters
+    if options["net"] == "TransformerUNetEx":
+        state_dict["transformer_dim"] = config.transformer_dim
+        state_dict["nhead"] = config.nhead
+        state_dict["num_layers"] = config.num_layers
+    
     torch.save(state_dict, options["output"])
+    print(f"Model saved to {options['output']}")
 
-    if (options["visualize"]):
-        out = DeepCFD(test_x[:10].to(options["device"]))
-        error = torch.abs(out.cpu() - test_y[:10].cpu())
+    # Visualize results if requested
+    if options["visualize"]:
+        print("Generating visualizations...")
+        sample_size = min(10, len(test_x))  # Limit to 10 samples for visualization
+        out = DeepCFD(test_x[:sample_size].to(options["device"]))
+        error = torch.abs(out.cpu() - test_y[:sample_size].cpu())
         s = 0
         visualize(
-            test_y[:10].cpu().detach().numpy(),
-            out[:10].cpu().detach().numpy(),
-            error[:10].cpu().detach().numpy(),
+            test_y[:sample_size].cpu().detach().numpy(),
+            out[:sample_size].cpu().detach().numpy(),
+            error[:sample_size].cpu().detach().numpy(),
             s
        )
+
+    # Save training metrics to file
+    metrics_filename = os.path.splitext(options["output"])[0] + "_metrics.json"
+    with open(metrics_filename, 'w') as f:
+        json.dump({
+            'train_loss': metrics['train_loss_curve'],
+            'val_loss': metrics['test_loss_curve'],
+            'train_mse': metrics['train_mse_curve'],
+            'val_mse': metrics['test_mse_curve'],
+            'train_ux': metrics['train_ux_curve'],
+            'val_ux': metrics['test_ux_curve'],
+            'train_uy': metrics['train_uy_curve'],
+            'val_uy': metrics['test_uy_curve'],
+            'train_p': metrics['train_p_curve'],
+            'val_p': metrics['test_p_curve']
+        }, f)
+    print(f"Training metrics saved to {metrics_filename}")
 
 if __name__ == "__main__":
     main()

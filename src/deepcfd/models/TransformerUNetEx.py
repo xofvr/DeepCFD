@@ -42,6 +42,10 @@ class PositionalEncoding2D(nn.Module):
         return x + self.pe[:x.size(0), :]
 
 class LayerNormConv2d(nn.Module):
+    """
+    Layer that applies Layer Normalization before convolution.
+    Helps with training stability in transformer-based models.
+    """
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1):
         super(LayerNormConv2d, self).__init__()
         # Layer norm first, normalizing over the channel dimension
@@ -91,28 +95,38 @@ class TransformerUNetEx(UNetEx):
         
         self.transformer_dim = transformer_dim
         
-        # Replace Conv2d with LayerNormConv2d for transformer-related layers
+        # Projection to transformer dimension
         self.to_transformer_dim = LayerNormConv2d(filters[-1], transformer_dim, kernel_size=1, padding=0)
         
         # Positional encoding (will be initialized in forward pass with actual feature map size)
         self.pos_encoder = None
         
-        # Use Layer Normalization in the transformer layers
+        # Transformer encoder configuration
         encoder_layer = TransformerEncoderLayer(
             d_model=transformer_dim,
             nhead=nhead,
             dim_feedforward=transformer_dim * 4,
             dropout=0.1,
             activation='relu',
-            # Layer normalization is used by default in PyTorch's TransformerEncoderLayer
-            # so no need to specify it explicitly
         )
         self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Use LayerNormConv2d for the projection back as well
+        # Projection back from transformer dimension
         self.from_transformer_dim = LayerNormConv2d(transformer_dim, filters[-1], kernel_size=1, padding=0)
         
+        # Learnable parameter for residual connection
         self.residual_alpha = nn.Parameter(torch.tensor(0.2))
+        
+    def _initialize_pos_encoder(self, x, height, width):
+        """Helper method to initialize or update positional encoding"""
+        if self.pos_encoder is None or self.pos_encoder.pe.size(0) != height * width:
+            self.pos_encoder = PositionalEncoding2D(self.transformer_dim, height, width)
+            
+            # Move to the same device as x
+            if x.device.type == 'mps':
+                self.pos_encoder = to_device(self.pos_encoder, x.device)
+            else:
+                self.pos_encoder = self.pos_encoder.to(x.device)
         
     def forward(self, x):
         """
@@ -127,24 +141,17 @@ class TransformerUNetEx(UNetEx):
         # Encode the input using the standard UNetEx encoder
         x, tensors, indices, sizes = self.encode(x)
         
+        # Store the encoder output for residual connection
+        transformer_input = x.clone()
+        
         # Process the encoded feature through transformer
         batch_size, channels, height, width = x.shape
         
         # Project to transformer dimension
         x_proj = self.to_transformer_dim(x)
         
-        transformer_input = x.clone()
-        
-        # Create positional encoding if not already created or if dimensions changed
-        if self.pos_encoder is None or self.pos_encoder.pe.size(0) != height * width:
-            self.pos_encoder = PositionalEncoding2D(self.transformer_dim, height, width)
-            # Move to the same device as x
-            self.pos_encoder = self.pos_encoder.to(x.device)
-            # Move to the same device as x
-            if x.device.type == 'mps':
-                self.pos_encoder = to_device(self.pos_encoder, x.device)
-            else:
-                self.pos_encoder = self.pos_encoder.to(x.device)
+        # Initialize or update positional encoding
+        self._initialize_pos_encoder(x, height, width)
         
         # Reshape to sequence format for transformer: (seq_len, batch, features)
         x_seq = x_proj.flatten(2).permute(2, 0, 1)
@@ -159,15 +166,16 @@ class TransformerUNetEx(UNetEx):
         x_transformed = x_transformed.permute(1, 2, 0).reshape(batch_size, self.transformer_dim, height, width)
         
         # Project back to original channel dimension
-        x = self.from_transformer_dim(x_transformed)
+        x_from_transformer = self.from_transformer_dim(x_transformed)
+        
+        # Add residual connection from encoder
+        x_bottleneck = x_from_transformer + self.residual_alpha * transformer_input
         
         # Decode using the standard UNetEx decoder
-        x = self.decode(x, tensors, indices, sizes)
+        x = self.decode(x_bottleneck, tensors, indices, sizes)
         
         # Apply final activation if specified
         if self.final_activation is not None:
             x = self.final_activation(x)
-        
-        x = self.from_transformer_dim(x_transformed) + self.residual_alpha * transformer_input
             
         return x

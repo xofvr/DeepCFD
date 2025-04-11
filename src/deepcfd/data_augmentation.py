@@ -1,6 +1,7 @@
 import torch
 import random
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
 
 class FluidDataAugmentation:
     """
@@ -8,6 +9,15 @@ class FluidDataAugmentation:
     that preserve physical meaning of the flow fields.
     """
     def __init__(self, flip_prob=0.3, rotate_prob=0.3, noise_prob=0.2, noise_level=0.02):
+        """
+        Initialize the augmentation with various transformation probabilities.
+        
+        Args:
+            flip_prob: Probability of applying horizontal flip
+            rotate_prob: Probability of applying rotation
+            noise_prob: Probability of adding noise to geometry
+            noise_level: Standard deviation of the noise to add
+        """
         self.flip_prob = flip_prob
         self.rotate_prob = rotate_prob
         self.noise_prob = noise_prob
@@ -65,8 +75,33 @@ class FluidDataAugmentation:
             
         return x_aug, y_aug
 
-# Function to create a data loader with augmentation
-def create_augmented_dataloader(dataset, batch_size, shuffle=True, augmentation=None):
+class AugmentedDataset(Dataset):
+    """Dataset wrapper that applies data augmentation on-the-fly"""
+    def __init__(self, dataset, transform=None):
+        """
+        Args:
+            dataset: Base dataset to wrap
+            transform: Augmentation transform to apply
+        """
+        self.dataset = dataset
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def __getitem__(self, idx):
+        x, y = self.dataset[idx]
+        
+        if self.transform:
+            # Add batch dimension for augmentation
+            x_aug, y_aug = self.transform(x.unsqueeze(0), y.unsqueeze(0))
+            # Remove batch dimension
+            return x_aug.squeeze(0), y_aug.squeeze(0)
+        
+        return x, y
+
+def create_augmented_dataloader(dataset, batch_size, shuffle=True, augmentation=None, 
+                               num_workers=4, pin_memory=True, drop_last=False):
     """
     Creates a DataLoader with on-the-fly data augmentation.
     
@@ -75,27 +110,29 @@ def create_augmented_dataloader(dataset, batch_size, shuffle=True, augmentation=
         batch_size: Batch size for the dataloader
         shuffle: Whether to shuffle the data
         augmentation: Augmentation object to apply
+        num_workers: Number of subprocesses for data loading
+        pin_memory: Pin memory for faster GPU transfers
+        drop_last: Whether to drop the last incomplete batch
         
     Returns:
         DataLoader with augmentation
     """
     if augmentation is None:
-        return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-    
-    class AugmentedDataset(torch.utils.data.Dataset):
-        def __init__(self, dataset, transform):
-            self.dataset = dataset
-            self.transform = transform
-            
-        def __len__(self):
-            return len(self.dataset)
-            
-        def __getitem__(self, idx):
-            x, y = self.dataset[idx]
-            # Add batch dimension for augmentation
-            x_aug, y_aug = self.transform(x.unsqueeze(0), y.unsqueeze(0))
-            # Remove batch dimension
-            return x_aug.squeeze(0), y_aug.squeeze(0)
+        return DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last
+        )
     
     augmented_dataset = AugmentedDataset(dataset, augmentation)
-    return torch.utils.data.DataLoader(augmented_dataset, batch_size=batch_size, shuffle=shuffle)
+    return DataLoader(
+        augmented_dataset, 
+        batch_size=batch_size, 
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last
+    )
