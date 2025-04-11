@@ -2,6 +2,7 @@ import copy
 import torch
 from .pytorchtools import EarlyStopping
 from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
+from .MPS_Utilities import to_device
 
 def generate_metrics_list(metrics_def):
     list = {}
@@ -15,6 +16,7 @@ def epoch(scope, loader, on_batch=None, training=False, max_grad_norm=1.0):
     optimizer = scope["optimizer"]
     loss_func = scope["loss_func"]
     metrics_def = scope["metrics_def"]
+    device = scope.get("device", None)
     scope = copy.copy(scope)
     scope["loader"] = loader
 
@@ -24,29 +26,38 @@ def epoch(scope, loader, on_batch=None, training=False, max_grad_norm=1.0):
         model.train()
     else:
         model.eval()
+        
     for tensors in loader:
         if "process_batch" in scope and scope["process_batch"] is not None:
             tensors = scope["process_batch"](tensors)
-        if "device" in scope and scope["device"] is not None:
-            tensors = [tensor.to(scope["device"]) for tensor in tensors]
+            
+        # Use the to_device utility to safely move tensors to the target device
+        if device is not None:
+            tensors = to_device(tensors, device)
+            
         loss, output = loss_func(model, tensors)
+        
         if training:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # More memory efficient
             loss.backward()
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            
         total_loss += loss.item()
         scope["batch"] = tensors
         scope["loss"] = loss
         scope["output"] = output
         scope["batch_metrics"] = {}
+        
         for name, metric in metrics_def.items():
             value = metric["on_batch"](scope)
             scope["batch_metrics"][name] = value
             metrics_list[name].append(value)
+            
         if on_batch is not None:
             on_batch(scope)
+            
     scope["metrics_list"] = metrics_list
     metrics = {}
     for name in metrics_def.keys():
@@ -64,6 +75,7 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
     epochs = scope["epochs"]
     model = scope["model"]
     metrics_def = scope["metrics_def"]
+    device = scope.get("device", None)
     scope = copy.copy(scope)
 
     scope["best_train_metric"] = None
@@ -72,68 +84,119 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
     scope["best_val_loss"] = float("inf")
     scope["best_model"] = None
     
-    augmentation = FluidDataAugmentation(
-        flip_prob=0.3, 
-        rotate_prob=0.3,
-        noise_prob=0.2,
-        noise_level=0.02
+    # Create dataloaders with appropriate settings for the device
+    pin_memory = device is not None and device.type == 'cuda'
+    
+    # Configure num_workers based on device type
+    if device is not None and device.type == 'mps':
+        # MPS sometimes has issues with multiple workers
+        num_workers = 0
+        persistent_workers = False
+    else:
+        num_workers = 2
+        persistent_workers = True if num_workers > 0 else False
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers
     )
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers
+    )
+    
     skips = 0
     for epoch_id in range(1, epochs + 1):
         scope["epoch"] = epoch_id
         print_function("Epoch #" + str(epoch_id), flush=True)
+        
         # Training
         scope["dataset"] = train_dataset
         train_loss, train_metrics = epoch(scope, train_loader, on_train_batch, training=True, max_grad_norm=max_grad_norm)
         scope["train_loss"] = train_loss
         scope["train_metrics"] = train_metrics
         print_function("\tTrain Loss = " + str(train_loss), flush=True)
+        
         for name in metrics_def.keys():
             print_function("\tTrain " + metrics_def[name]["name"] + " = " + str(train_metrics[name]), flush=True)
+        
         if on_train_epoch is not None:
             on_train_epoch(scope)
+        
         del scope["dataset"]
+        
         # Step the scheduler after training phase but before validation
         if scheduler is not None:
             scheduler.step()
             print_function(f"\tLearning rate: {scheduler.get_lr()[0]:.7f}", flush=True)
+        
         # Validation
         scope["dataset"] = val_dataset
+        
         with torch.no_grad():
             val_loss, val_metrics = epoch(scope, val_loader, on_val_batch, training=False)
+        
         scope["val_loss"] = val_loss
         scope["val_metrics"] = val_metrics
         print_function("\tValidation Loss = " + str(val_loss), flush=True)
+        
         for name in metrics_def.keys():
             print_function("\tValidation " + metrics_def[name]["name"] + " = " + str(val_metrics[name]), flush=True)
+        
         if on_val_epoch is not None:
             on_val_epoch(scope)
+        
         del scope["dataset"]
+        
         # Selection
         is_best = None
         if eval_model is not None:
             is_best = eval_model(scope)
+        
         if is_best is None:
             is_best = val_loss < scope["best_val_loss"]
+        
         if is_best:
             scope["best_train_metric"] = train_metrics
             scope["best_train_loss"] = train_loss
             scope["best_val_metrics"] = val_metrics
             scope["best_val_loss"] = val_loss
-            scope["best_model"] = copy.deepcopy(model)
+            
+            # Make a copy of the model on CPU to save memory on GPU
+            cpu_model = copy.deepcopy(model)
+            if device is not None:
+                cpu_model = cpu_model.to('cpu')
+            scope["best_model"] = cpu_model
+            
             print_function("Model saved!", flush=True)
             skips = 0
         else:
             skips += 1
+        
         if after_epoch is not None:
             after_epoch(scope)
-        early_stopping(val_loss, scope["best_model"])
+        
+        early_stopping(val_loss, model)
         if early_stopping.early_stop:
             print_function("Early stopping", flush=True)
             break
+
+        # Explicit memory cleanup to help with memory management
+        if device is not None and device.type in ['cuda', 'mps']:
+            torch.cuda.empty_cache() if device.type == 'cuda' else None
+    
+    # Move best model back to the original device at the end
+    if device is not None:
+        scope["best_model"] = scope["best_model"].to(device)
 
     return scope["best_model"], scope["best_train_metric"], scope["best_train_loss"],\
            scope["best_val_metrics"], scope["best_val_loss"]
@@ -141,8 +204,11 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
 
 def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process_batch=None, eval_model=None,
                 on_train_batch=None, on_val_batch=None, on_train_epoch=None, on_val_epoch=None, after_epoch=None,
-                epochs=100, batch_size=256, patience=10, device=0, scheduler=None, max_grad_norm=1.0, **kwargs):
-    model = model.to(device)
+                epochs=100, batch_size=256, patience=10, device=None, scheduler=None, max_grad_norm=1.0, **kwargs):
+    # Move model to the specified device
+    if device is not None:
+        model = model.to(device)
+        
     scope = {}
     scope["model"] = model
     scope["loss_func"] = loss_func
@@ -154,6 +220,7 @@ def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process
     scope["batch_size"] = batch_size
     scope["device"] = device
     scope["scheduler"] = scheduler
+    
     metrics_def = {}
     names = []
     for key in kwargs.keys():
@@ -161,6 +228,7 @@ def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process
         if len(parts) == 3 and parts[0] == "m":
             if parts[1] not in names:
                 names.append(parts[1])
+                
     for name in names:
         if "m_" + name + "_name" in kwargs and "m_" + name + "_on_batch" in kwargs and "m_" + name + "_on_epoch" in kwargs:
             metrics_def[name] = {
@@ -170,7 +238,9 @@ def train_model(model, loss_func, train_dataset, val_dataset, optimizer, process
             }
         else:
             print("Warning: " + name + " metric is incomplete!")
+            
     scope["metrics_def"] = metrics_def
+    
     return train(scope, train_dataset, val_dataset, eval_model=eval_model, on_train_batch=on_train_batch,
            on_val_batch=on_val_batch, on_train_epoch=on_train_epoch, on_val_epoch=on_val_epoch, after_epoch=after_epoch,
            batch_size=batch_size, patience=patience, scheduler=scheduler, max_grad_norm=max_grad_norm)

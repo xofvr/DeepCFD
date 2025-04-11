@@ -5,6 +5,7 @@ import pickle
 import random
 import getopt
 import sys
+import warnings
 from .train_functions import *
 from .functions import *
 import torch.optim as optim
@@ -13,13 +14,14 @@ from torch.autograd import Variable
 from .lr_scheduler import TransformerLRScheduler
 from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
 from .config import DeepCFDConfig
+from .MPS_Utilities import to_device
 
 # changed to mps from cuda 
 def parseOpts(argv):
     
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
@@ -62,7 +64,7 @@ def parseOpts(argv):
     for opt, arg in opts:
         if opt == '-h' or opt == '--help':
             print("deepcfd "
-                "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', (default: cuda if available)"
+                "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', 'mps' (default: best available)"
                 "\n    -n  <net> network architecture: UNet, UNetEx, "
                     "TransformerUNetEx or AutoEncoder (default: UNetEx)"
                 "\n    -mi <model-input>  input dataset with sdf1,"
@@ -82,14 +84,45 @@ def parseOpts(argv):
             )
             sys.exit()
         elif opt in ("-d", "--device"):
-            if arg == "mps" and torch.backends.mps.is_available():
+            if arg == "mps" and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 device = torch.device("mps")
+                print("Using Apple Silicon GPU (MPS)")
             elif arg == "cpu":
                 device = torch.device("cpu")
-            elif arg.startswith("cuda") and torch.cuda.is_available():
-                device = torch.device(arg)
+                print("Using CPU for training")
+            elif arg.startswith("cuda"):
+                if torch.cuda.is_available():
+                    # Handle multiple GPUs case properly
+                    if ',' in arg:
+                        # Multi-GPU setup through DataParallel
+                        ids = [int(x.strip()) for x in arg.split(':')[1].split(',')]
+                        for id in ids:
+                            if id >= torch.cuda.device_count():
+                                print(f"Warning: GPU {id} requested but not available. Using available GPUs only.")
+                                ids = [i for i in ids if i < torch.cuda.device_count()]
+                                break
+                        if ids:
+                            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in ids)
+                            device = torch.device("cuda")
+                        else:
+                            device = torch.device("cuda:0")
+                    else:
+                        # Single GPU setup
+                        if ':' in arg:
+                            idx = int(arg.split(':')[1])
+                            if idx >= torch.cuda.device_count():
+                                print(f"Warning: GPU {idx} requested but not available. Using GPU 0.")
+                                device = torch.device("cuda:0")
+                            else:
+                                device = torch.device(arg)
+                        else:
+                            device = torch.device("cuda")
+                    print(f"Using CUDA device: {device}")
+                else:
+                    print("CUDA requested but not available. Falling back to CPU.")
+                    device = torch.device("cpu")
             else:
-                print("Unkown device " + str(arg) + ", only 'cpu', 'cuda'"
+                print("Unkown device " + str(arg) + ", only 'cpu', 'cuda', 'mps'"
                     "'cuda:index', or comma-separated list of 'cuda:index'"
                     "are supported")
                 exit(0)
@@ -156,12 +189,27 @@ def main():
     config = DeepCFDConfig()
     options = config.parse_args(sys.argv[1:])
     
+    # Detect and show device info
+    if options["device"].type == "cuda":
+        print(f"Using CUDA device: {options['device']}")
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"Available GPU(s): {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+    elif options["device"].type == "mps":
+        print("Using Apple Silicon GPU (MPS)")
+        if not torch.backends.mps.is_built():
+            warnings.warn("PyTorch MPS backend is not built. Training will be slow. Consider installing a PyTorch version with MPS support.")
+    else:
+        print("Using CPU for training")
+
     # Save the configuration for reproducibility
     config_filename = os.path.splitext(options["output"])[0] + "_config.json"
     config.save_to_json(config_filename)
     print(f"Configuration saved to {config_filename}")
 
     # Load data
+    print("Loading training data...")
     x = pickle.load(open(options["model_input"], "rb"))
     y = pickle.load(open(options["model_output"], "rb"))
 
@@ -181,7 +229,8 @@ def main():
     # Calculate the weights for each channel based on their magnitude
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
-    channels_weights = channels_weights.to(options["device"])
+    # Keep channels_weights on CPU until needed
+    # We'll move it to the appropriate device during the loss_func call
 
     # Ensure output directory exists
     dirname = os.path.dirname(os.path.abspath(options["output"]))
@@ -208,7 +257,7 @@ def main():
             shuffle=True,
             augmentation=augmentation,
             num_workers=config.num_workers,
-            pin_memory=True
+            pin_memory=(options["device"].type != "mps")  # Pin memory doesn't work well with MPS
         )
     else:
         train_loader = create_augmented_dataloader(
@@ -216,7 +265,7 @@ def main():
             batch_size=options["batch_size"], 
             shuffle=True,
             num_workers=config.num_workers,
-            pin_memory=True
+            pin_memory=(options["device"].type != "mps")
         )
     
     # Get a sample for testing
@@ -224,6 +273,8 @@ def main():
     
     # Set reproducible seed
     torch.manual_seed(0)
+    if options["device"].type == "cuda":
+        torch.cuda.manual_seed_all(0)
 
     # Initialize model based on the selected architecture
     model_args = {
@@ -290,25 +341,26 @@ def main():
         metrics['test_p_curve'].append(scope["val_metrics"]["p"])
 
     def loss_func(model, batch):
-        """Custom loss function with component weighting"""
         x, y = batch
-        x = x.to(options["device"])
-        y = y.to(options["device"])
+        device = next(model.parameters()).device  # Get device from model
+        x = to_device(x, device)
+        y = to_device(y, device)
         output = model(x)
         
-        # Calculate component-wise loss
-        lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
-        lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
-        lossp = torch.abs((output[:,2,:,:] - y[:,2,:,:])).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
+        # Reshape using view instead of reshape for better memory efficiency
+        lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
+        lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
+        lossp = torch.abs(output[:,2,:,:] - y[:,2,:,:]).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
         
-        # Apply component importance weighting
-        weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / channels_weights.to(output.device)
+        # Ensure weights are on the same device
+        device_weights = to_device(channels_weights, device)
+        weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / device_weights
         
         return torch.sum(weighted_loss), output
-    
+
     # Train the model
     DeepCFD, train_metrics, train_loss, test_metrics, test_loss = train_model(
         model,
@@ -366,13 +418,18 @@ def main():
     if options["visualize"]:
         print("Generating visualizations...")
         sample_size = min(10, len(test_x))  # Limit to 10 samples for visualization
-        out = DeepCFD(test_x[:sample_size].to(options["device"]))
-        error = torch.abs(out.cpu() - test_y[:sample_size].cpu())
+        # Ensure test data is on the correct device
+        test_x_device = to_device(test_x[:sample_size], options["device"])
+        out = DeepCFD(test_x_device)
+        # Move results back to CPU for visualization
+        out_cpu = out.cpu()
+        test_y_cpu = test_y[:sample_size].cpu() 
+        error = torch.abs(out_cpu - test_y_cpu)
         s = 0
         visualize(
-            test_y[:sample_size].cpu().detach().numpy(),
-            out[:sample_size].cpu().detach().numpy(),
-            error[:sample_size].cpu().detach().numpy(),
+            test_y_cpu.detach().numpy(),
+            out_cpu.detach().numpy(),
+            error.detach().numpy(),
             s
        )
 
