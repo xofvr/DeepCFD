@@ -74,9 +74,13 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
 
     epochs = scope["epochs"]
     model = scope["model"]
+    optimizer = scope["optimizer"]  # Make sure we get the optimizer from the scope
     metrics_def = scope["metrics_def"]
     device = scope.get("device", None)
     scope = copy.copy(scope)
+
+    # Ensure optimizer is included in the copied scope
+    scope["optimizer"] = optimizer
 
     scope["best_train_metric"] = None
     scope["best_train_loss"] = float("inf")
@@ -134,11 +138,6 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
         
         del scope["dataset"]
         
-        # Step the scheduler after training phase but before validation
-        if scheduler is not None:
-            scheduler.step()
-            print_function(f"\tLearning rate: {scheduler.get_lr()[0]:.7f}", flush=True)
-        
         # Validation
         scope["dataset"] = val_dataset
         
@@ -154,6 +153,18 @@ def train(scope, train_dataset, val_dataset, patience=10, batch_size=256, print_
         
         if on_val_epoch is not None:
             on_val_epoch(scope)
+        
+        # Step the scheduler with validation metrics if it's ReduceLROnPlateau
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+                # Get current learning rate
+                current_lr = [group['lr'] for group in optimizer.param_groups][0]
+                print_function(f"\tLearning rate: {current_lr:.7f}", flush=True)
+            else:
+                scheduler.step()
+                if hasattr(scheduler, 'get_last_lr'):
+                    print_function(f"\tLearning rate: {scheduler.get_last_lr()[0]:.7f}", flush=True)
         
         del scope["dataset"]
         

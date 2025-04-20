@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 
 def create_layer(in_channels, out_channels, kernel_size, wn=True, bn=True,

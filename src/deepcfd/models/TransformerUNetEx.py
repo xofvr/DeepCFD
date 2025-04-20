@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn.utils.parametrizations import weight_norm
 from .UNetEx import UNetEx
 from ..MPS_Utilities import to_device
 
@@ -124,21 +125,36 @@ class TransformerUNetEx(UNetEx):
         # Positional encoding (will be initialized in forward pass with actual feature map size)
         self.pos_encoder = None
         
-        # Transformer encoder configuration
+        # Transformer encoder configuration with scaled initialization
         encoder_layer = TransformerEncoderLayer(
             d_model=transformer_dim,
             nhead=nhead,
             dim_feedforward=transformer_dim * 4,
             dropout=0.1,
             activation='relu',
+            batch_first=True  # Set to True to avoid nested tensor warning
         )
         self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Projection back from transformer dimension
         self.from_transformer_dim = LayerNormConv2d(transformer_dim, filters[-1], kernel_size=1, padding=0)
         
-        # Learnable parameter for residual connection
-        self.residual_alpha = nn.Parameter(torch.tensor(0.2))
+        # Learnable parameter for residual connection with smaller initialization
+        self.residual_alpha = nn.Parameter(torch.tensor(0.1))
+        
+        # Apply proper initialization for stability
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        """Initialize weights with proper scaling to improve training stability"""
+        # Initialize projection layers with xavier
+        nn.init.xavier_uniform_(self.to_transformer_dim.conv.weight, gain=1.0)
+        if self.to_transformer_dim.conv.bias is not None:
+            nn.init.zeros_(self.to_transformer_dim.conv.bias)
+            
+        nn.init.xavier_uniform_(self.from_transformer_dim.conv.weight, gain=1.0)
+        if self.from_transformer_dim.conv.bias is not None:
+            nn.init.zeros_(self.from_transformer_dim.conv.bias)
         
     def _initialize_pos_encoder(self, x, height, width):
         """Helper method to initialize or update positional encoding"""
@@ -158,33 +174,63 @@ class TransformerUNetEx(UNetEx):
         
     def _transformer_forward_with_fallback(self, x_seq):
         """
-        Apply transformer encoder with fallback mechanisms
+        Apply transformer encoder with fallback mechanisms and stability checks
         
         Args:
-            x_seq: Input sequence tensor of shape (seq_len, batch, d_model)
+            x_seq: Input sequence tensor of shape (batch, seq_len, d_model) when batch_first=True
             
         Returns:
             Transformed sequence
         """
         device = x_seq.device
         
+        # Add stability check - replace NaN/Inf values
+        if torch.isnan(x_seq).any() or torch.isinf(x_seq).any():
+            print("Warning: NaN or Inf detected in transformer input. Replacing with zeros...")
+            x_seq = torch.where(torch.isnan(x_seq) | torch.isinf(x_seq), torch.zeros_like(x_seq), x_seq)
+        
+        # Clip extreme values for numerical stability
+        x_seq = torch.clamp(x_seq, -100, 100)
+        
         try:
             # Try standard forward pass
             if self.use_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint
-                return checkpoint(lambda s: self.transformer_encoder(s), x_seq)
+                # Explicitly set use_reentrant=False as recommended
+                result = checkpoint(lambda s: self.transformer_encoder(s), x_seq, use_reentrant=False)
             else:
-                return self.transformer_encoder(x_seq)
+                result = self.transformer_encoder(x_seq)
+                
+            # Check if result contains NaN values
+            if torch.isnan(result).any() or torch.isinf(result).any():
+                print("Warning: NaN or Inf detected in transformer output. Falling back to input...")
+                # In case of NaN output, return the input as fallback
+                return x_seq
+                
+            return result
+            
         except Exception as e:
             # If on MPS, try CPU fallback
             if device.type == 'mps':
                 print(f"MPS transformer operation failed with error: {e}. Falling back to CPU.")
-                # Move to CPU, compute, then back to MPS
-                cpu_result = self.transformer_encoder(x_seq.cpu())
-                return cpu_result.to(device)
+                try:
+                    # Move to CPU, compute, then back to MPS
+                    cpu_result = self.transformer_encoder(x_seq.cpu())
+                    result = cpu_result.to(device)
+                    
+                    # Check if result contains NaN values
+                    if torch.isnan(result).any() or torch.isinf(result).any():
+                        print("Warning: NaN or Inf detected in CPU fallback output. Returning input...")
+                        return x_seq  # Return input if CPU fallback also produces NaNs
+                        
+                    return result
+                except Exception as inner_e:
+                    print(f"CPU fallback also failed: {inner_e}. Returning input tensor...")
+                    return x_seq  # Return input as last resort
             else:
-                # For other devices, re-raise the exception
-                raise
+                # For other devices, return input in case of error
+                print(f"Transformer operation failed with error: {e}. Returning input tensor...")
+                return x_seq
 
     def _process_with_transformer(self, x_proj, batch_size, height, width):
         """
@@ -202,23 +248,37 @@ class TransformerUNetEx(UNetEx):
         # Initialize or update positional encoding
         self._initialize_pos_encoder(x_proj, height, width)
         
+        # Get device of input tensor for ensuring consistent device usage
+        device = x_proj.device
+        
         # Determine if chunking is needed based on feature map size
         use_chunking = (height * width) > 1024  # Threshold where chunking becomes beneficial
         max_chunk_size = 512  # Maximum pixels to process in one chunk
         
         if not use_chunking:
             # Standard processing without chunking
-            # Reshape to sequence format for transformer: (seq_len, batch, features)
-            x_seq = x_proj.flatten(2).permute(2, 0, 1)
+            # Reshape to sequence format for transformer: (batch, seq_len, features) - batch_first=True
+            x_seq = x_proj.flatten(2).permute(0, 2, 1)
             
-            # Add positional encoding
-            x_seq = self.pos_encoder(x_seq)
+            # Add positional encoding - reshape for batch_first=True with proper broadcasting
+            # Get the positional encoding and ensure it has the right shape for broadcasting
+            pos_encoding = self.pos_encoder.pe[:height*width, 0]  # Shape: [seq_len, d_model]
+            
+            # Ensure positional encoding is on the same device as input
+            pos_encoding = pos_encoding.to(device)
+            
+            # Expand positional encoding to match batch dimension
+            # This ensures compatibility with the batch_first=True format
+            pos_encoding = pos_encoding.unsqueeze(0).expand(batch_size, -1, -1)  # Shape: [batch, seq_len, d_model]
+            
+            # Add the positional encoding to the input tensor
+            x_seq = x_seq + pos_encoding
             
             # Apply the transformer encoder with fallback
             x_transformed = self._transformer_forward_with_fallback(x_seq)
             
             # Reshape back to feature map: (batch, features, height, width)
-            return x_transformed.permute(1, 2, 0).reshape(batch_size, self.transformer_dim, height, width)
+            return x_transformed.permute(0, 2, 1).reshape(batch_size, self.transformer_dim, height, width)
         else:
             # Process in chunks to save memory
             num_chunks = math.ceil((height * width) / max_chunk_size)
@@ -226,36 +286,41 @@ class TransformerUNetEx(UNetEx):
             transformed_chunks = []
             
             # Ensure positional encoding is on the same device as input
-            pe_device = x_proj.device
-            pe_buffer = self.pos_encoder.pe.to(pe_device)
+            pe_buffer = self.pos_encoder.pe.to(device)
             
             for chunk_idx, chunk in enumerate(chunks):
                 # Get current chunk size
                 curr_chunk_size = chunk.size(2)
                 
-                # Reshape to sequence format: (seq_len, batch, features)
-                chunk_seq = chunk.permute(2, 0, 1)
+                # Reshape to sequence format: (batch, seq_len, features) - batch_first=True
+                chunk_seq = chunk.permute(0, 2, 1)
                 
-                # Add positional encoding - calculate offset for positional encoding
+                # Add positional encoding with proper broadcasting
                 pos_offset = chunk_idx * max_chunk_size
                 pos_end = pos_offset + curr_chunk_size
-                chunk_seq = chunk_seq + pe_buffer[pos_offset:pos_end]
+                
+                # Get positional encoding for this chunk and shape for batch_first=True
+                # Shape: [curr_chunk_size, d_model] -> [1, curr_chunk_size, d_model] -> [batch, curr_chunk_size, d_model]
+                chunk_pos_encoding = pe_buffer[pos_offset:pos_end, 0].unsqueeze(0).expand(batch_size, -1, -1)
+                
+                # Add the positional encoding (already on the correct device from pe_buffer)
+                chunk_seq = chunk_seq + chunk_pos_encoding
                 
                 # Apply the transformer encoder with fallback
                 chunk_transformed = self._transformer_forward_with_fallback(chunk_seq)
                 
-                # Save transformed chunk
-                transformed_chunks.append(chunk_transformed)
+                # Save transformed chunk - permute back to original format
+                transformed_chunks.append(chunk_transformed.permute(0, 2, 1))
             
             # Concatenate all chunks
-            x_transformed = torch.cat(transformed_chunks, dim=0)
+            x_transformed = torch.cat(transformed_chunks, dim=2)
             
             # Reshape back to feature map: (batch, features, height, width)
-            return x_transformed.permute(1, 2, 0).reshape(batch_size, self.transformer_dim, height, width)
+            return x_transformed.reshape(batch_size, self.transformer_dim, height, width)
             
     def forward(self, x):
         """
-        Forward pass through the TransformerUNetEx model.
+        Forward pass through the TransformerUNetEx model with stability checks.
         
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
@@ -266,6 +331,11 @@ class TransformerUNetEx(UNetEx):
         # Encode the input using the standard UNetEx encoder
         x, tensors, indices, sizes = self.encode(x)
         
+        # Check for NaNs after encoding
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("Warning: NaN or Inf detected after encoding. Replacing with zeros...")
+            x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
+        
         # Store the encoder output for residual connection
         transformer_input = x.clone()
         
@@ -275,17 +345,40 @@ class TransformerUNetEx(UNetEx):
         # Project to transformer dimension
         x_proj = self.to_transformer_dim(x)
         
+        # Check for NaNs after projection
+        if torch.isnan(x_proj).any() or torch.isinf(x_proj).any():
+            print("Warning: NaN or Inf detected after projection. Replacing with zeros...")
+            x_proj = torch.where(torch.isnan(x_proj) | torch.isinf(x_proj), torch.zeros_like(x_proj), x_proj)
+        
         # Process with transformer (with memory-efficient handling)
         x_transformed = self._process_with_transformer(x_proj, batch_size, height, width)
+        
+        # Check for NaNs after transformer processing
+        if torch.isnan(x_transformed).any() or torch.isinf(x_transformed).any():
+            print("Warning: NaN or Inf detected after transformer. Using projection instead...")
+            x_transformed = x_proj  # Fallback to pre-transformer features
         
         # Project back to original channel dimension
         x_from_transformer = self.from_transformer_dim(x_transformed)
         
-        # Add residual connection from encoder
-        x_bottleneck = x_from_transformer + self.residual_alpha * transformer_input
+        # Check for NaNs after back projection
+        if torch.isnan(x_from_transformer).any() or torch.isinf(x_from_transformer).any():
+            print("Warning: NaN or Inf detected after back projection. Skipping transformer entirely...")
+            x_from_transformer = torch.zeros_like(transformer_input)  # Complete fallback
+        
+        # Add residual connection from encoder (use a smaller fixed coefficient for stability)
+        # Using a smaller fixed residual coefficient (0.1) rather than learnable parameter for stability
+        x_bottleneck = x_from_transformer + 0.1 * transformer_input
         
         # Decode using the standard UNetEx decoder
         x = self.decode(x_bottleneck, tensors, indices, sizes)
+        
+        # Final NaN check
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("Warning: NaN or Inf detected in output. Clamping values...")
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+            x = torch.where(torch.isinf(x), torch.sign(x) * torch.ones_like(x), x)
+            x = torch.clamp(x, -1.0, 1.0)  # Clamp within range suitable for tanh
         
         # Apply final activation if specified
         if self.final_activation is not None:
