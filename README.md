@@ -41,7 +41,7 @@ python -m deepcfd.scripts.train_transformer_model \
 --model-input data/dataX.pkl
 --model-output data/dataY.pkl
 --output trained_models/transformer_model.pt
---device cpu
+--device CUDA
 --filters 16,32,64,64
 --learning-rate 0.001
 --batch-size 32

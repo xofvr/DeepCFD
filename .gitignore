@@ -33,3 +33,10 @@ _Results/
 
 # Documentation files (if needed)
 DeepCFD.md
+
+cuda-keyring_1.1-1_all.deb
+visualization*/
+
+trained_model*/
+
+.pt_config.json

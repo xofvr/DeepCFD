@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import weight_norm
 from .AutoEncoder import create_layer
 from ..MPS_Utilities import custom_max_unpool2d, safe_max_pool2d_with_indices
 from torch.nn import Transformer

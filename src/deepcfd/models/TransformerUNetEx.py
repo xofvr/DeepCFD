@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import weight_norm
 from .UNetEx import UNetEx
 from ..MPS_Utilities import to_device
 
