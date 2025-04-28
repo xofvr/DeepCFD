@@ -230,18 +230,22 @@ def main():
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
     # Keep channels_weights on CPU until needed
-    # We'll move it to the appropriate device during the loss_func call
 
-    # Ensure output directory exists
-    dirname = os.path.dirname(os.path.abspath(options["output"]))
-    if dirname and not os.path.exists(dirname):
-       os.makedirs(dirname, exist_ok=True)
-
-    # Split dataset into 70% train and 30% test
-    train_data, test_data = split_tensors(x, y, ratio=0.7)
+    # Split dataset into 70% train, 15% validation and 15% test
+    train_size = int(0.7 * len(x))
+    val_size = int(0.15 * len(x))
+    test_size = len(x) - train_size - val_size
+    
+    # Create dataset splits
+    train_x, val_x, test_x = x[:train_size], x[train_size:train_size+val_size], x[train_size+val_size:]
+    train_y, val_y, test_y = y[:train_size], y[train_size:train_size+val_size], y[train_size+val_size:]
+    
+    print(f"Dataset split: {train_size} training samples, {val_size} validation samples, {test_size} test samples")
     
     # Create datasets
-    train_dataset, test_dataset = TensorDataset(*train_data), TensorDataset(*test_data)
+    train_dataset = TensorDataset(train_x, train_y)
+    val_dataset = TensorDataset(val_x, val_y)
+    test_dataset = TensorDataset(test_x, test_y)
     
     # Set up data augmentation if requested
     if config.use_augmentation:

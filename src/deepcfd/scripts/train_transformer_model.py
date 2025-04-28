@@ -327,16 +327,19 @@ def main():
     x_tensor = torch.tensor(x_data, dtype=torch.float32)
     y_tensor = torch.tensor(y_data, dtype=torch.float32)
     
-    # Create dataset and split into train/val sets
+    # Create dataset and split into train/val/test sets
     dataset = TensorDataset(x_tensor, y_tensor)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    
-    # Use a fixed random seed for reproducible train/val splits
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+
+    # Use a fixed random seed for reproducible dataset splits
     generator = torch.Generator().manual_seed(args.seed)
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=generator
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size], generator=generator
     )
+
+    print(f"Dataset split: {train_size} training samples, {val_size} validation samples, {test_size} test samples")
     
     # Parse filters
     filters = list(map(int, args.filters.split(',')))
@@ -615,6 +618,80 @@ def main():
             print(f"Best {metric_name}: {metric_values[best_epoch]:.6f}")
     
     print("\nTraining complete. Use model for inference with appropriate inverse transformations.")
+    
+    # Evaluate on test set
+    print("\nEvaluating final model performance on test set...")
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size,
+        shuffle=False
+    )
+    
+    # Perform evaluation
+    model.eval()
+    with torch.no_grad():
+        test_loss = 0
+        test_mse = 0
+        test_ux_mse = 0
+        test_uy_mse = 0
+        test_p_mse = 0
+        test_samples = 0
+        
+        for x, y in test_loader:
+            # Move to device
+            if device is not None:
+                x = x.to(device)
+                y = y.to(device)
+            
+            # Forward pass
+            y_pred = model(x)
+            
+            # Calculate loss
+            loss, _ = loss_function(model, (x, y))
+            
+            # Calculate component-wise MSE
+            ux_mse = torch.mean((y_pred[:, 0, :, :] - y[:, 0, :, :]) ** 2).item()
+            uy_mse = torch.mean((y_pred[:, 1, :, :] - y[:, 1, :, :]) ** 2).item()
+            p_mse = torch.mean((y_pred[:, 2, :, :] - y[:, 2, :, :]) ** 2).item()
+            mse = (ux_mse + uy_mse + p_mse) / 3
+            
+            # Accumulate test metrics
+            batch_size = x.size(0)
+            test_loss += loss.item() * batch_size
+            test_mse += mse * batch_size
+            test_ux_mse += ux_mse * batch_size
+            test_uy_mse += uy_mse * batch_size
+            test_p_mse += p_mse * batch_size
+            test_samples += batch_size
+        
+        # Calculate averages
+        avg_test_loss = test_loss / test_samples
+        avg_test_mse = test_mse / test_samples
+        avg_test_ux_mse = test_ux_mse / test_samples
+        avg_test_uy_mse = test_uy_mse / test_samples
+        avg_test_p_mse = test_p_mse / test_samples
+    
+    # Report test metrics
+    print(f"Test Loss: {avg_test_loss:.6f}")
+    print(f"Test MSE: {avg_test_mse:.6f}")
+    print(f"Test Ux MSE: {avg_test_ux_mse:.6f}")
+    print(f"Test Uy MSE: {avg_test_uy_mse:.6f}")
+    print(f"Test P MSE: {avg_test_p_mse:.6f}")
+    
+    # Save test metrics to the model configuration
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    
+    model_config['test_metrics'] = {
+        'loss': avg_test_loss,
+        'mse': avg_test_mse,
+        'ux_mse': avg_test_ux_mse,
+        'uy_mse': avg_test_uy_mse,
+        'p_mse': avg_test_p_mse
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(model_config, f, indent=4)
 
 if __name__ == "__main__":
     main()
