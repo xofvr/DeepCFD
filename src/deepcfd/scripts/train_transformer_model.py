@@ -609,13 +609,23 @@ def main():
     
     # Create a summary of best validation performance
     print("\nBest Model Performance Summary:")
-    print(f"Best validation loss: {min(val_loss):.6f}")
-    
-    # Get metrics at best epoch
-    best_epoch = val_loss.index(min(val_loss))
-    for metric_name, metric_values in val_metrics.items():
-        if best_epoch < len(metric_values):
-            print(f"Best {metric_name}: {metric_values[best_epoch]:.6f}")
+    # Fix the TypeError by checking if val_loss is a list or float
+    if isinstance(val_loss, list):
+        print(f"Best validation loss: {min(val_loss):.6f}")
+        # Get metrics at best epoch
+        best_epoch = val_loss.index(min(val_loss))
+        for metric_name, metric_values in val_metrics.items():
+            if best_epoch < len(metric_values):
+                print(f"Best {metric_name}: {metric_values[best_epoch]:.6f}")
+    else:
+        # If val_loss is a float, just print it directly
+        print(f"Best validation loss: {val_loss:.6f}")
+        # Print the last values of metrics if available
+        for metric_name, metric_values in val_metrics.items():
+            if isinstance(metric_values, list) and metric_values:
+                print(f"Best {metric_name}: {metric_values[-1]:.6f}")
+            elif not isinstance(metric_values, list):
+                print(f"Best {metric_name}: {metric_values:.6f}")
     
     print("\nTraining complete. Use model for inference with appropriate inverse transformations.")
     

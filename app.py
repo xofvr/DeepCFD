@@ -20,28 +20,13 @@ st.set_page_config(
 
 # Page title
 st.title("TransformerDeepCFD Dashboard")
-st.write("Upload your trained model and dataset to visualize flow field predictions")
 
-# Sidebar for model loading
-with st.sidebar:
-    st.header("Model & Data Upload")
-    
-    # Model file uploader
-    model_file = st.file_uploader("Upload trained model (.pt file)", type=["pt"])
-    
-    # Data file uploader
-    data_file = st.file_uploader("Upload test data (.pkl file)", type=["pkl"])
-    
-    # Add info about model architecture
-    st.subheader("Model Architecture")
-    architecture = st.selectbox(
-        "Select model architecture",
-        ["UNetEx", "TransformerUNetEx", "AutoEncoder"]
-    )
-    
-    # Or choose from existing models
-    st.markdown("---")
-    st.subheader("Or select from available models")
+# Simplified interface with two columns for model and data selection
+col1, col2 = st.columns(2)
+
+with col1:
+    # Model selection
+    st.subheader("Model Selection")
     
     # Detect available models
     model_paths = []
@@ -60,6 +45,13 @@ with st.sidebar:
                 model_paths.append(os.path.join('./models', file))
                 model_names.append(f"models/{file}")
                 
+    # Check trained_models directory if it exists
+    if os.path.exists('./trained_models'):
+        for file in os.listdir('./trained_models'):
+            if file.endswith('.pt'):
+                model_paths.append(os.path.join('./trained_models', file))
+                model_names.append(f"trained_models/{file}")
+    
     # Check in checkpoint directory if it exists
     if os.path.exists('./checkpoint'):
         for file in os.listdir('./checkpoint'):
@@ -67,60 +59,91 @@ with st.sidebar:
                 model_paths.append(os.path.join('./checkpoint', file))
                 model_names.append(f"checkpoint/{file}")
     
-    # Add option for no selection
-    model_names.insert(0, "None (Use uploaded file)")
+    # Add option for file upload
+    model_names.insert(0, "Upload model file")
     model_paths.insert(0, None)
     
     selected_model_name = st.selectbox("Select model", model_names)
-    selected_model_path = model_paths[model_names.index(selected_model_name)]
     
-    # Data selection from filesystem
-    st.markdown("---")
-    st.subheader("Or select data from filesystem")
+    # Only show file uploader if upload option is selected
+    model_file = None
+    if selected_model_name == "Upload model file":
+        model_file = st.file_uploader("Upload trained model (.pt file)", type=["pt"])
+        selected_model_path = None
+    else:
+        selected_model_path = model_paths[model_names.index(selected_model_name)]
+
+with col2:
+    # Data selection
+    st.subheader("Data Selection")
+    
+    # Data selection options
+    data_option = st.radio(
+        "Data source",
+        ["Default data", "Upload data", "Custom path"]
+    )
     
     # Default data paths
     default_input_path = "./data/dataX.pkl"
     default_output_path = "./data/dataY.pkl"
     
-    use_default_data = st.checkbox("Use default data paths", value=True)
-    
-    if use_default_data:
-        input_data_path = default_input_path
-        output_data_path = default_output_path
-    else:
+    data_file = None
+    if data_option == "Upload data":
+        data_file = st.file_uploader("Upload test data (.pkl file)", type=["pkl"])
+        input_data_path = None
+        output_data_path = None
+    elif data_option == "Custom path":
         input_data_path = st.text_input("Input data path (dataX.pkl)", default_input_path)
         output_data_path = st.text_input("Output data path (dataY.pkl)", default_output_path)
+    else:  # Default data
+        input_data_path = default_input_path
+        output_data_path = default_output_path
+
 
 # Function to load model
-def load_model(model_bytes, architecture):
+def load_model(model_bytes):
     try:
-        # Load state dict
-        state_dict = torch.load(io.BytesIO(model_bytes), map_location=torch.device('cpu'))
+        # Check if model_bytes is provided
+        if model_bytes:
+            # Load state dict from bytes
+            state_dict = torch.load(io.BytesIO(model_bytes), map_location=torch.device('cpu'))
+        else:
+            # We're loading from a path, this will be handled differently
+            return None
+            
+        # Try to detect if this is the enhanced transformer model
+        is_enhanced_model = False
         
-        # Get model parameters from state dict or use defaults
-        filters = state_dict.get("filters", [8, 16, 32, 32])
-        kernel_size = state_dict.get("kernel_size", 5)
+        # If this is the enhanced model, load its config file
+        if "transformer_model_enhanced" in str(model_bytes):
+            config_path = "./trained_models/transformer_model_enhanced_config.json"
+            if os.path.exists(config_path):
+                import json
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                filters = config.get("filters", [16, 32, 64, 64])
+                kernel_size = config.get("kernel_size", 3)
+                transformer_dim = config.get("transformer_dim", 192)
+                nhead = config.get("nhead", 6)
+                num_layers = config.get("num_layers", 3)
+                is_enhanced_model = True
         
-        # Additional parameters for transformer models
-        transformer_dim = state_dict.get("transformer_dim", 128)
-        nhead = state_dict.get("nhead", 4)
-        num_layers = state_dict.get("num_layers", 2)
+        # If not enhanced model or config not found, get from state dict or use defaults
+        if not is_enhanced_model:
+            filters = state_dict.get("filters", [8, 16, 32, 32])
+            kernel_size = state_dict.get("kernel_size", 5)
+            transformer_dim = state_dict.get("transformer_dim", 128)
+            nhead = state_dict.get("nhead", 4)
+            num_layers = state_dict.get("num_layers", 2)
         
-        # Import correct model architecture
-        if architecture == "UNetEx":
-            from deepcfd.models.UNetEx import UNetEx
-            model = UNetEx(3, 3, filters=filters, kernel_size=kernel_size)
-        elif architecture == "TransformerUNetEx":
-            from deepcfd.models.TransformerUNetEx import TransformerUNetEx
-            model = TransformerUNetEx(3, 3, 
-                                     filters=filters, 
-                                     kernel_size=kernel_size,
-                                     transformer_dim=transformer_dim,
-                                     nhead=nhead,
-                                     num_layers=num_layers)
-        else:  # AutoEncoder
-            from deepcfd.models.AutoEncoder import AutoEncoder
-            model = AutoEncoder(3, 3, filters=filters, kernel_size=kernel_size)
+        # Import TransformerUNetEx model
+        from deepcfd.models.TransformerUNetEx import TransformerUNetEx
+        model = TransformerUNetEx(3, 3, 
+                                 filters=filters, 
+                                 kernel_size=kernel_size,
+                                 transformer_dim=transformer_dim,
+                                 nhead=nhead,
+                                 num_layers=num_layers)
         
         # Clean state dict for loading - remove metadata keys
         clean_state_dict = {k: v for k, v in state_dict.items() 
@@ -216,76 +239,6 @@ def visualize_cfd_results(truth, prediction, sample_idx=0):
     return fig
 
 
-def load_and_plot_training_log(log_file):
-    """
-    Load and plot training log data showing loss over epochs
-    
-    Args:
-        log_file: Path to training log file
-    
-    Returns:
-        fig: Matplotlib figure
-    """
-    try:
-        # Read log file
-        with open(log_file, 'r') as f:
-            lines = f.readlines()
-        
-        # Parse data
-        epochs = []
-        train_loss = []
-        val_loss = []
-        
-        for line in lines:
-            if "Epoch" in line and "Train Loss" in line and "Val Loss" in line:
-                parts = line.strip().split()
-                
-                # Extract epoch number
-                epoch_idx = parts.index("Epoch")
-                if epoch_idx + 1 < len(parts):
-                    try:
-                        # Remove colon if present
-                        epoch_str = parts[epoch_idx + 1].rstrip(':')
-                        epochs.append(int(epoch_str))
-                    except ValueError:
-                        continue
-                
-                # Extract train loss
-                train_idx = parts.index("Loss:")
-                if train_idx + 1 < len(parts):
-                    try:
-                        train_loss.append(float(parts[train_idx + 1]))
-                    except ValueError:
-                        continue
-                
-                # Extract validation loss
-                val_idx = parts.index("Loss:", train_idx + 1) if "Val" in line else -1
-                if val_idx != -1 and val_idx + 1 < len(parts):
-                    try:
-                        val_loss.append(float(parts[val_idx + 1]))
-                    except ValueError:
-                        continue
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        if epochs and train_loss:
-            ax.plot(epochs, train_loss, 'b-', label='Training Loss')
-        if epochs and val_loss and len(val_loss) == len(epochs):
-            ax.plot(epochs, val_loss, 'r-', label='Validation Loss')
-        
-        ax.set_xlabel('Epochs')
-        ax.set_ylabel('Loss')
-        ax.set_title('Training and Validation Loss')
-        ax.legend()
-        ax.grid(True)
-        
-        return fig
-    except Exception as e:
-        st.error(f"Error loading training log: {str(e)}")
-        return None
-
-
 # Main dashboard logic
 def run_inference(model, x_data, y_data=None):
     # Show data information
@@ -366,13 +319,82 @@ if __name__ == "__main__":
     # Try to load model from uploaded file or selected path
     if model_file:
         model_bytes = model_file.getvalue()
-        model = load_model(model_bytes, architecture)
+        model = load_model(model_bytes)
     elif selected_model_path:
         try:
-            model = load_model(None, architecture)
-            # Load state dict directly from file
+            # Check if this is the enhanced model
+            if "transformer_model_enhanced" in selected_model_path:
+                # Load the configuration
+                config_path = "./trained_models/transformer_model_enhanced_config.json"
+                if os.path.exists(config_path):
+                    import json
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    
+                    # Get model parameters
+                    filters = config.get("filters", [16, 32, 64, 64]) 
+                    kernel_size = config.get("kernel_size", 3)
+                    transformer_dim = config.get("transformer_dim", 192)
+                    nhead = config.get("nhead", 6)
+                    num_layers = config.get("num_layers", 3)
+                    
+                    # Create model with correct parameters
+                    from deepcfd.models.TransformerUNetEx import TransformerUNetEx
+                    model = TransformerUNetEx(3, 3, 
+                                         filters=filters, 
+                                         kernel_size=kernel_size,
+                                         transformer_dim=transformer_dim,
+                                         nhead=nhead,
+                                         num_layers=num_layers)
+                else:
+                    # Fallback to default instantiation
+                    state_dict = torch.load(selected_model_path, map_location=torch.device('cpu'))
+                    
+                    # Use defaults
+                    filters = [8, 16, 32, 32]
+                    kernel_size = 5
+                    transformer_dim = 128
+                    nhead = 4
+                    num_layers = 2
+                    
+                    # Create model with default parameters
+                    from deepcfd.models.TransformerUNetEx import TransformerUNetEx
+                    model = TransformerUNetEx(3, 3, 
+                                         filters=filters, 
+                                         kernel_size=kernel_size,
+                                         transformer_dim=transformer_dim,
+                                         nhead=nhead,
+                                         num_layers=num_layers)
+            else:
+                # Regular model - use defaults or try to extract from state_dict
+                state_dict = torch.load(selected_model_path, map_location=torch.device('cpu'))
+                
+                # Get parameters from state dict or use defaults
+                filters = state_dict.get("filters", [8, 16, 32, 32])
+                kernel_size = state_dict.get("kernel_size", 5)
+                transformer_dim = state_dict.get("transformer_dim", 128)
+                nhead = state_dict.get("nhead", 4)
+                num_layers = state_dict.get("num_layers", 2)
+                
+                # Create TransformerUNetEx model
+                from deepcfd.models.TransformerUNetEx import TransformerUNetEx
+                model = TransformerUNetEx(3, 3, 
+                                     filters=filters, 
+                                     kernel_size=kernel_size,
+                                     transformer_dim=transformer_dim,
+                                     nhead=nhead,
+                                     num_layers=num_layers)
+            
+            # Load state dict
             state_dict = torch.load(selected_model_path, map_location=torch.device('cpu'))
-            model.load_state_dict(state_dict)
+            
+            # Clean state dict for loading - remove metadata keys
+            clean_state_dict = {k: v for k, v in state_dict.items() 
+                              if not k.startswith('_') and k not in 
+                              ["architecture", "input_shape", "filters", "kernel_size", 
+                               "transformer_dim", "nhead", "num_layers"]}
+            
+            model.load_state_dict(clean_state_dict, strict=False)
             model.eval()
             st.success(f"Model loaded from {selected_model_name}")
         except Exception as e:
@@ -387,7 +409,7 @@ if __name__ == "__main__":
             x_data, y_data = data
         else:
             x_data = data
-    elif use_default_data or (input_data_path and os.path.exists(input_data_path)):
+    elif data_option in ["Default data", "Custom path"] and input_data_path:
         # Try to load X data
         x_data = load_data(file_path=input_data_path)
         
@@ -410,95 +432,15 @@ if __name__ == "__main__":
         # Run inference and visualization
         run_inference(model, x_data, y_data)
         
-        # Check if there's a training log file associated with the selected model
-        if model is not None:
-            st.markdown("---")
-            st.subheader("Training Progress")
-            
-            # Look for training log files
-            available_logs = []
-            
-            # Try to find log file with same name as model
-            if selected_model_path:
-                model_name = os.path.basename(selected_model_path).replace('.pt', '')
-                for log_name in [f"training_log_{model_name}.txt", f"training_log{model_name}.txt", "training_log.txt"]:
-                    if os.path.exists(log_name):
-                        available_logs.append((log_name, log_name))
-            
-            # Check in root directory
-            for log_file in ["training_log.txt", "training_log1.txt", "training_log2.txt"]:
-                if os.path.exists(log_file) and (log_file, log_file) not in available_logs:
-                    available_logs.append((log_file, log_file))
-                    
-            # Check in deepcfd directory
-            for log_file in ["training_log.txt", "training_log1.txt", "training_log2.txt"]:
-                path = os.path.join("DeepCFD", log_file)
-                if os.path.exists(path) and (path, log_file) not in available_logs:
-                    available_logs.append((path, log_file))
-            
-            if available_logs:
-                selected_log = st.selectbox("Select training log", 
-                                            options=[name for _, name in available_logs],
-                                            index=0)
-                
-                # Find the file path for the selected name
-                selected_log_path = next((path for path, name in available_logs if name == selected_log), None)
-                
-                if selected_log_path:
-                    log_fig = load_and_plot_training_log(selected_log_path)
-                    if log_fig:
-                        st.pyplot(log_fig)
-                    else:
-                        st.info("Could not parse training log file format.")
-            else:
-                st.info("No training log files found for this model.")
-                
-            # Add model stats
-            if model:
-                st.subheader("Model Statistics")
-                # Calculate number of parameters
-                total_params = sum(p.numel() for p in model.parameters())
-                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                
-                # Display in columns
-                cols = st.columns(4)
-                cols[0].metric("Total Parameters", f"{total_params:,}")
-                cols[1].metric("Trainable Parameters", f"{trainable_params:,}")
-                
-                # Try to extract epochs and learning rate from state dict if available
-                if hasattr(model, '_trained_epochs'):
-                    cols[2].metric("Epochs Trained", model._trained_epochs)
-                if hasattr(model, '_learning_rate'):
-                    cols[3].metric("Learning Rate", model._learning_rate)
     else:
         if model is None:
-            st.info("Please upload or select a model file to continue.")
+            st.info("Please select or upload a model file to continue.")
         if x_data is None:
-            st.info("Please upload or select input data to continue.")
+            st.info("Please select or upload input data to continue.")
         
-        # Display example images
-        cols = st.columns(2)
-        with cols[0]:
-            st.subheader("Sample Velocity Field (Ux)")
-            placeholder_img = Image.new('RGB', (300, 300), color='white')
-            st.image(placeholder_img, caption="Load data and model to see prediction")
-        
-        with cols[1]:
-            st.subheader("Sample Pressure Field (p)")
-            placeholder_img = Image.new('RGB', (300, 300), color='white')
-            st.image(placeholder_img, caption="Load data and model to see prediction")
-        
-        # Add readme section showing architecture diagram
-        if os.path.exists("./ReadmeFiles/arch.png"):
-            st.markdown("---")
-            st.subheader("TransformerDeepCFD Architecture")
-            st.image("./ReadmeFiles/arch.png", caption="Model Architecture")
-            
-            # Add example flows if available
-            example_files = [f for f in os.listdir("./ReadmeFiles") if f.endswith(".png") and f != "arch.png" and f != "DataStruct.png"]
-            if len(example_files) > 0:
-                st.subheader("Example Flow Predictions")
-                cols = st.columns(2)
-                for i, file in enumerate(example_files[:4]):  # Show up to 4 examples
-                    with cols[i % 2]:
-                        st.image(f"./ReadmeFiles/{file}", caption=file.replace(".png", ""))
+        # Display example of what to expect
+        st.subheader("Expected visualization output")
+        cols = st.columns(3)
+        for i, channel in enumerate(["Ux", "Uy", "Pressure"]):
+            with cols[i]:
+                st.text(f"{channel} field")
