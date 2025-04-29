@@ -295,6 +295,8 @@ def get_training_args():
     
     # Training arguments
     parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--lr-schedule', type=str, default='onecycle', choices=['onecycle', 'reduce', 'cosine', 'none'],
+                       help='Learning rate schedule type')
     parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--patience', type=int, default=300, help='Patience for early stopping')
@@ -370,14 +372,14 @@ def main():
         nhead=config['nhead'],
         num_layers=config['num_layers'],
         use_checkpointing=config['use_checkpointing'],
-        final_activation=None  # No final activation since we're using our own transformations
+        final_activation=None,  # No final activation since we're using our own transformations
+        dropout=0.2  # Add dropout for regularization - helps with R² instability
     )
     
     # Apply proper weight initialization for different layer types
     def init_weights(m):
         if isinstance(m, torch.nn.Conv2d):
             # Kaiming initialization for convolutional layers
-            # Better for ReLU activations and helps with vanishing/exploding gradients
             torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 # Initialize biases to a small constant for better stability
@@ -388,7 +390,6 @@ def main():
             torch.nn.init.constant_(m.bias, 0)
         elif isinstance(m, torch.nn.Linear):
             # Xavier initialization for linear layers
-            # Good for layers with various activation functions
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 torch.nn.init.constant_(m.bias, 0)
@@ -397,25 +398,27 @@ def main():
     model.apply(init_weights)
     
     # Create optimizer with improved hyperparameters
-    optimizer = torch.optim.AdamW(  # AdamW instead of Adam for better weight decay handling
+    # Use a simple fixed learning rate approach - no complex scheduling
+    # Start with a much lower learning rate for stability
+    initial_lr = args.learning_rate * 0.05  # Use 5% of the original learning rate
+    
+    optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=args.learning_rate * 0.1,  # Reduced learning rate for stability
+        lr=initial_lr,
         betas=(0.9, 0.999),
-        eps=1e-5,  # Higher epsilon for numerical stability
-        weight_decay=1e-4  # L2 regularization
+        eps=1e-8,
+        weight_decay=1e-4  # Keep the weight decay for regularization
     )
     
-    # Use OneCycleLR scheduler for better convergence
-    # This implements the 1cycle policy from the paper "Super-Convergence: Very Fast Training of Neural Networks"
-    # It helps reach better minima faster and reduces overfitting
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # Use a very simple step decay scheduler that reduces the learning rate
+    # by a factor of 0.5 every 200 epochs, but only if validation doesn't improve
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        max_lr=args.learning_rate,
-        steps_per_epoch=train_size // args.batch_size + (1 if train_size % args.batch_size != 0 else 0),
-        epochs=args.epochs,
-        pct_start=0.3,  # Spend 30% of training in warmup phase
-        div_factor=25.0,  # initial_lr = max_lr/div_factor
-        final_div_factor=10000.0,  # final_lr = initial_lr/final_div_factor
+        mode='min',
+        factor=0.5,
+        patience=100,  # Wait 100 epochs before reducing LR
+        verbose=True,
+        min_lr=1e-6
     )
     
     # Save transformation parameters for later use in inference

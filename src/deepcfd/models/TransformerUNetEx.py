@@ -93,7 +93,8 @@ class TransformerUNetEx(UNetEx):
     """
     def __init__(self, in_channels, out_channels, kernel_size=3, filters=[16, 32, 64], layers=3,
                  weight_norm=True, batch_norm=True, activation=nn.ReLU, final_activation=None,
-                 transformer_dim=128, nhead=4, num_layers=2, use_checkpointing=True): 
+                 transformer_dim=128, nhead=4, num_layers=2, use_checkpointing=True,
+                 dropout=0.2):  # Added dropout parameter with default value
         """
         Args:
             in_channels: Number of input channels
@@ -109,6 +110,7 @@ class TransformerUNetEx(UNetEx):
             nhead: Number of attention heads in transformer
             num_layers: Number of transformer encoder layers
             use_checkpointing: Whether to use gradient checkpointing to save memory
+            dropout: Dropout rate for transformer layers (default: 0.2)
         """
         super().__init__(in_channels, out_channels, kernel_size, filters, layers, 
                          weight_norm, batch_norm, activation, final_activation)
@@ -118,6 +120,7 @@ class TransformerUNetEx(UNetEx):
         
         self.transformer_dim = transformer_dim
         self.use_checkpointing = use_checkpointing
+        self.dropout_rate = dropout  # Store dropout rate
         
         # Projection to transformer dimension
         self.to_transformer_dim = LayerNormConv2d(filters[-1], transformer_dim, kernel_size=1, padding=0)
@@ -130,11 +133,14 @@ class TransformerUNetEx(UNetEx):
             d_model=transformer_dim,
             nhead=nhead,
             dim_feedforward=transformer_dim * 4,
-            dropout=0.1,
+            dropout=dropout,  # Use the provided dropout parameter
             activation='relu',
             batch_first=True  # Set to True to avoid nested tensor warning
         )
         self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Additional dropout layers for better regularization
+        self.dropout = nn.Dropout(dropout)
         
         # Projection back from transformer dimension
         self.from_transformer_dim = LayerNormConv2d(transformer_dim, filters[-1], kernel_size=1, padding=0)
@@ -345,6 +351,10 @@ class TransformerUNetEx(UNetEx):
         # Project to transformer dimension
         x_proj = self.to_transformer_dim(x)
         
+        # Apply dropout before transformer for regularization (when training)
+        if self.training:
+            x_proj = self.dropout(x_proj)
+        
         # Check for NaNs after projection
         if torch.isnan(x_proj).any() or torch.isinf(x_proj).any():
             print("Warning: NaN or Inf detected after projection. Replacing with zeros...")
@@ -361,6 +371,10 @@ class TransformerUNetEx(UNetEx):
         # Project back to original channel dimension
         x_from_transformer = self.from_transformer_dim(x_transformed)
         
+        # Apply dropout after transformer output for regularization (when training)
+        if self.training:
+            x_from_transformer = self.dropout(x_from_transformer)
+            
         # Check for NaNs after back projection
         if torch.isnan(x_from_transformer).any() or torch.isinf(x_from_transformer).any():
             print("Warning: NaN or Inf detected after back projection. Skipping transformer entirely...")
