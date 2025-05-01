@@ -37,19 +37,17 @@ pip install -e .
 To train a TransformerDeepCFD model:
 
 ```bash
-python -m deepcfd \
-    --net TransformerUNetEx \
-    --device mps \
-    --model-input data/dataX.pkl \
-    --model-output data/dataY.pkl \
-    --output model_transformer.pt \
-    --kernel-size 5 \
-    --filters 8,16,32,32 \
-    --learning-rate 0.001 \
-    --epochs 1000 \
-    --batch-size 32 \
-    --patience 300 \
-    --visualize > training_log.txt
+python -m deepcfd.scripts.train_transformer_model \
+--model-input data/dataX.pkl
+--model-output data/dataY.pkl
+--output trained_models/transformer_model.pt
+--device CUDA
+--filters 16,32,64,64
+--learning-rate 0.001
+--batch-size 32
+--epochs 1000
+--patience 300
+--visualize > traininglog.txt
 ```
 
 ### Parameters:

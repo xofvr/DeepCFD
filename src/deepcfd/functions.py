@@ -1,6 +1,8 @@
 import torch.nn as nn
 import numpy as np
 from matplotlib import pyplot as plt
+import os
+import datetime
 
 def split_tensors(*tensors, ratio):
     assert len(tensors) > 0
@@ -21,7 +23,7 @@ def initialize(model, gain=1, std=0.02):
             if module.bias is not None:
                 nn.init.normal_(module.bias, 0, std)
 
-def visualize(sample_y, out_y, error, s):
+def visualize(sample_y, out_y, error, s, save_to_file=False):
     minu = np.min(sample_y[s, 0, :, :])
     maxu = np.max(sample_y[s, 0, :, :])
 
@@ -84,4 +86,17 @@ def visualize(sample_y, out_y, error, s):
     plt.imshow(np.transpose(error[s, 2, :, :]), vmin = minep, vmax = maxep, **plot_options)
     plt.colorbar(orientation='horizontal')
     plt.tight_layout()
-    plt.show()
+    
+    if save_to_file:
+        # Create visualization directory if it doesn't exist
+        vis_dir = os.path.join(os.getcwd(), "visualization_output")
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        # Generate unique filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(vis_dir, f"vis_{timestamp}.png")
+        plt.savefig(filename)
+        plt.close()
+        return filename
+    else:
+        plt.show()

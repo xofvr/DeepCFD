@@ -5,6 +5,7 @@ import pickle
 import random
 import getopt
 import sys
+import warnings
 from .train_functions import *
 from .functions import *
 import torch.optim as optim
@@ -12,13 +13,15 @@ from torch.utils.data import TensorDataset
 from torch.autograd import Variable
 from .lr_scheduler import TransformerLRScheduler
 from .data_augmentation import FluidDataAugmentation, create_augmented_dataloader
+from .config import DeepCFDConfig
+from .MPS_Utilities import to_device
 
 # changed to mps from cuda 
 def parseOpts(argv):
     
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
@@ -61,7 +64,7 @@ def parseOpts(argv):
     for opt, arg in opts:
         if opt == '-h' or opt == '--help':
             print("deepcfd "
-                "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', (default: cuda if available)"
+                "\n    -d  <device> device: 'cpu', 'cuda', 'cuda:0', 'cuda:0,cuda:n', 'mps' (default: best available)"
                 "\n    -n  <net> network architecture: UNet, UNetEx, "
                     "TransformerUNetEx or AutoEncoder (default: UNetEx)"
                 "\n    -mi <model-input>  input dataset with sdf1,"
@@ -81,14 +84,45 @@ def parseOpts(argv):
             )
             sys.exit()
         elif opt in ("-d", "--device"):
-            if arg == "mps" and torch.backends.mps.is_available():
+            if arg == "mps" and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 device = torch.device("mps")
+                print("Using Apple Silicon GPU (MPS)")
             elif arg == "cpu":
                 device = torch.device("cpu")
-            elif arg.startswith("cuda") and torch.cuda.is_available():
-                device = torch.device(arg)
+                print("Using CPU for training")
+            elif arg.startswith("cuda"):
+                if torch.cuda.is_available():
+                    # Handle multiple GPUs case properly
+                    if ',' in arg:
+                        # Multi-GPU setup through DataParallel
+                        ids = [int(x.strip()) for x in arg.split(':')[1].split(',')]
+                        for id in ids:
+                            if id >= torch.cuda.device_count():
+                                print(f"Warning: GPU {id} requested but not available. Using available GPUs only.")
+                                ids = [i for i in ids if i < torch.cuda.device_count()]
+                                break
+                        if ids:
+                            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in ids)
+                            device = torch.device("cuda")
+                        else:
+                            device = torch.device("cuda:0")
+                    else:
+                        # Single GPU setup
+                        if ':' in arg:
+                            idx = int(arg.split(':')[1])
+                            if idx >= torch.cuda.device_count():
+                                print(f"Warning: GPU {idx} requested but not available. Using GPU 0.")
+                                device = torch.device("cuda:0")
+                            else:
+                                device = torch.device(arg)
+                        else:
+                            device = torch.device("cuda")
+                    print(f"Using CUDA device: {device}")
+                else:
+                    print("CUDA requested but not available. Falling back to CPU.")
+                    device = torch.device("cpu")
             else:
-                print("Unkown device " + str(arg) + ", only 'cpu', 'cuda'"
+                print("Unkown device " + str(arg) + ", only 'cpu', 'cuda', 'mps'"
                     "'cuda:index', or comma-separated list of 'cuda:index'"
                     "are supported")
                 exit(0)
@@ -151,8 +185,31 @@ def parseOpts(argv):
     return options
 
 def main():
-    options = parseOpts(sys.argv[1:])
+    # Parse command-line arguments using the new config system
+    config = DeepCFDConfig()
+    options = config.parse_args(sys.argv[1:])
+    
+    # Detect and show device info
+    if options["device"].type == "cuda":
+        print(f"Using CUDA device: {options['device']}")
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"Available GPU(s): {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+    elif options["device"].type == "mps":
+        print("Using Apple Silicon GPU (MPS)")
+        if not torch.backends.mps.is_built():
+            warnings.warn("PyTorch MPS backend is not built. Training will be slow. Consider installing a PyTorch version with MPS support.")
+    else:
+        print("Using CPU for training")
 
+    # Save the configuration for reproducibility
+    config_filename = os.path.splitext(options["output"])[0] + "_config.json"
+    config.save_to_json(config_filename)
+    print(f"Configuration saved to {config_filename}")
+
+    # Load data
+    print("Loading training data...")
     x = pickle.load(open(options["model_input"], "rb"))
     y = pickle.load(open(options["model_output"], "rb"))
 
@@ -169,96 +226,146 @@ def main():
     nx = x.shape[2]
     ny = x.shape[3]
 
+    # Calculate the weights for each channel based on their magnitude
     channels_weights = torch.sqrt(torch.mean(y.permute(0, 2, 3, 1)
         .reshape((batch*nx*ny,3)) ** 2, dim=0)).view(1, -1, 1, 1)
+    # Keep channels_weights on CPU until needed
 
-    channels_weights = channels_weights.to(options["device"])
-
-    dirname = os.path.dirname(os.path.abspath(options["output"]))
-    if dirname and not os.path.exists(dirname):
-       os.makedirs(dirname, exist_ok=True)
-
-    # Spliting dataset into 70% train and 30% test
-    train_data, test_data = split_tensors(x, y, ratio=0.7)
+    # Split dataset into 70% train, 15% validation and 15% test
+    train_size = int(0.7 * len(x))
+    val_size = int(0.15 * len(x))
+    test_size = len(x) - train_size - val_size
     
-    train_dataset, test_dataset = TensorDataset(*train_data), TensorDataset(*test_data)
+    # Create dataset splits
+    train_x, val_x, test_x = x[:train_size], x[train_size:train_size+val_size], x[train_size+val_size:]
+    train_y, val_y, test_y = y[:train_size], y[train_size:train_size+val_size], y[train_size+val_size:]
+    
+    print(f"Dataset split: {train_size} training samples, {val_size} validation samples, {test_size} test samples")
+    
+    # Create datasets
+    train_dataset = TensorDataset(train_x, train_y)
+    val_dataset = TensorDataset(val_x, val_y)
+    test_dataset = TensorDataset(test_x, test_y)
+    
+    # Set up data augmentation if requested
+    if config.use_augmentation:
+        print("Using data augmentation")
+        augmentation = FluidDataAugmentation(
+            flip_prob=config.aug_flip_prob,
+            rotate_prob=config.aug_rotate_prob,
+            noise_prob=config.aug_noise_prob
+        )
+        train_loader = create_augmented_dataloader(
+            train_dataset, 
+            batch_size=options["batch_size"], 
+            shuffle=True,
+            augmentation=augmentation,
+            num_workers=config.num_workers,
+            pin_memory=(options["device"].type != "mps")  # Pin memory doesn't work well with MPS
+        )
+    else:
+        train_loader = create_augmented_dataloader(
+            train_dataset, 
+            batch_size=options["batch_size"], 
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=(options["device"].type != "mps")
+        )
+    
+    # Get a sample for testing
     test_x, test_y = test_dataset[:]
     
+    # Set reproducible seed
     torch.manual_seed(0)
+    if options["device"].type == "cuda":
+        torch.cuda.manual_seed_all(0)
 
-    model = options["net"](
-        3,
-        3,
-        filters=options["filters"],
-        kernel_size=options["kernel_size"],
-        batch_norm=False,
-        weight_norm=False
-    ) 
-
+    # Initialize model based on the selected architecture
+    model_args = {
+        'in_channels': 3,
+        'out_channels': 3,
+        'filters': options["filters"],
+        'kernel_size': options["kernel_size"],
+        'batch_norm': config.use_batch_norm,
+        'weight_norm': config.use_weight_norm
+    }
+    
+    # Add transformer-specific parameters if using TransformerUNetEx
+    if options["net"] == "TransformerUNetEx":
+        model_args.update({
+            'transformer_dim': config.transformer_dim,
+            'nhead': config.nhead,
+            'num_layers': config.num_layers
+        })
+        
+    model = options["net_class"](**model_args)
 
     # Define optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=options["learning_rate"],
-        weight_decay=0.005
+        weight_decay=config.weight_decay
     )
     
-    # Much fewer warmup steps
-    warmup_steps = int(0.02 * options["epochs"])  # Reduce from 10% to 2%
-    # Higher starting learning rate
+    # Configure learning rate scheduler
+    warmup_steps = int(0.02 * options["epochs"])  # 2% of total epochs for warmup
     scheduler = TransformerLRScheduler(
         optimizer, 
         warmup_steps=warmup_steps,
         max_steps=options["epochs"],
-        min_lr=1e-6,  # Slightly higher min LR
-        warmup_init_lr=1e-4  # Start ~100x higher
+        min_lr=1e-6,
+        warmup_init_lr=1e-4
     )
 
-    config = {}        
-    train_loss_curve = []
-    test_loss_curve = []
-    train_mse_curve = []
-    test_mse_curve = []
-    train_ux_curve = []
-    test_ux_curve = []
-    train_uy_curve = []
-    test_uy_curve = []
-    train_p_curve = []
-    test_p_curve = []
+    # Initialize metrics tracking
+    metrics = {
+        'train_loss_curve': [],
+        'test_loss_curve': [],
+        'train_mse_curve': [],
+        'test_mse_curve': [],
+        'train_ux_curve': [],
+        'test_ux_curve': [],
+        'train_uy_curve': [],
+        'test_uy_curve': [],
+        'train_p_curve': [],
+        'test_p_curve': []
+    }
     
     def after_epoch(scope):
-        train_loss_curve.append(scope["train_loss"])
-        test_loss_curve.append(scope["val_loss"])
-        train_mse_curve.append(scope["train_metrics"]["mse"])
-        test_mse_curve.append(scope["val_metrics"]["mse"])
-        train_ux_curve.append(scope["train_metrics"]["ux"])
-        test_ux_curve.append(scope["val_metrics"]["ux"])
-        train_uy_curve.append(scope["train_metrics"]["uy"])
-        test_uy_curve.append(scope["val_metrics"]["uy"])
-        train_p_curve.append(scope["train_metrics"]["p"])
-        test_p_curve.append(scope["val_metrics"]["p"])
+        """Callback function after each epoch to track metrics"""
+        metrics['train_loss_curve'].append(scope["train_loss"])
+        metrics['test_loss_curve'].append(scope["val_loss"])
+        metrics['train_mse_curve'].append(scope["train_metrics"]["mse"])
+        metrics['test_mse_curve'].append(scope["val_metrics"]["mse"])
+        metrics['train_ux_curve'].append(scope["train_metrics"]["ux"])
+        metrics['test_ux_curve'].append(scope["val_metrics"]["ux"])
+        metrics['train_uy_curve'].append(scope["train_metrics"]["uy"])
+        metrics['test_uy_curve'].append(scope["val_metrics"]["uy"])
+        metrics['train_p_curve'].append(scope["train_metrics"]["p"])
+        metrics['test_p_curve'].append(scope["val_metrics"]["p"])
 
     def loss_func(model, batch):
         x, y = batch
-        x = x.to(options["device"])
-        y = y.to(options["device"])
+        device = next(model.parameters()).device  # Get device from model
+        x = to_device(x, device)
+        y = to_device(y, device)
         output = model(x)
         
-        # Keep the original reshape pattern
-        lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
-        lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
-        lossp = torch.abs((output[:,2,:,:] - y[:,2,:,:])).reshape(
-            (output.shape[0],1,output.shape[2],output.shape[3]))
+        # Reshape using view instead of reshape for better memory efficiency
+        lossu = ((output[:,0,:,:] - y[:,0,:,:]) ** 2).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
+        lossv = ((output[:,1,:,:] - y[:,1,:,:]) ** 2).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
+        lossp = torch.abs(output[:,2,:,:] - y[:,2,:,:]).view(
+            output.shape[0], 1, output.shape[2], output.shape[3])
         
-        # Use channel weights as before, but add importance weighting
-        # This preserves the original scaling while emphasizing components differently
-        weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / channels_weights.to(output.device)
+        # Ensure weights are on the same device
+        device_weights = to_device(channels_weights, device)
+        weighted_loss = (lossu * 0.4 + lossv * 0.4 + lossp * 0.2) / device_weights
         
         return torch.sum(weighted_loss), output
-    
-    # Training model
+
+    # Train the model
     DeepCFD, train_metrics, train_loss, test_metrics, test_loss = train_model(
         model,
         loss_func,
@@ -295,24 +402,57 @@ def main():
             len(scope["dataset"]), patience=options["patience"], after_epoch=after_epoch
     )
 
+    # Save model with metadata
     state_dict = DeepCFD.state_dict()
     state_dict["input_shape"] = (1, 3, nx, ny)
     state_dict["filters"] = options["filters"]
     state_dict["kernel_size"] = options["kernel_size"]
     state_dict["architecture"] = options["net"]
     
+    # For transformer models, save additional parameters
+    if options["net"] == "TransformerUNetEx":
+        state_dict["transformer_dim"] = config.transformer_dim
+        state_dict["nhead"] = config.nhead
+        state_dict["num_layers"] = config.num_layers
+    
     torch.save(state_dict, options["output"])
+    print(f"Model saved to {options['output']}")
 
-    if (options["visualize"]):
-        out = DeepCFD(test_x[:10].to(options["device"]))
-        error = torch.abs(out.cpu() - test_y[:10].cpu())
+    # Visualize results if requested
+    if options["visualize"]:
+        print("Generating visualizations...")
+        sample_size = min(10, len(test_x))  # Limit to 10 samples for visualization
+        # Ensure test data is on the correct device
+        test_x_device = to_device(test_x[:sample_size], options["device"])
+        out = DeepCFD(test_x_device)
+        # Move results back to CPU for visualization
+        out_cpu = out.cpu()
+        test_y_cpu = test_y[:sample_size].cpu() 
+        error = torch.abs(out_cpu - test_y_cpu)
         s = 0
         visualize(
-            test_y[:10].cpu().detach().numpy(),
-            out[:10].cpu().detach().numpy(),
-            error[:10].cpu().detach().numpy(),
+            test_y_cpu.detach().numpy(),
+            out_cpu.detach().numpy(),
+            error.detach().numpy(),
             s
        )
+
+    # Save training metrics to file
+    metrics_filename = os.path.splitext(options["output"])[0] + "_metrics.json"
+    with open(metrics_filename, 'w') as f:
+        json.dump({
+            'train_loss': metrics['train_loss_curve'],
+            'val_loss': metrics['test_loss_curve'],
+            'train_mse': metrics['train_mse_curve'],
+            'val_mse': metrics['test_mse_curve'],
+            'train_ux': metrics['train_ux_curve'],
+            'val_ux': metrics['test_ux_curve'],
+            'train_uy': metrics['train_uy_curve'],
+            'val_uy': metrics['test_uy_curve'],
+            'train_p': metrics['train_p_curve'],
+            'val_p': metrics['test_p_curve']
+        }, f)
+    print(f"Training metrics saved to {metrics_filename}")
 
 if __name__ == "__main__":
     main()
