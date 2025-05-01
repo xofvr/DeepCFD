@@ -410,16 +410,47 @@ def main():
         weight_decay=1e-4  # Keep the weight decay for regularization
     )
     
-    # Use a very simple step decay scheduler that reduces the learning rate
-    # by a factor of 0.5 every 200 epochs, but only if validation doesn't improve
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=100,  # Wait 100 epochs before reducing LR
-        verbose=True,
-        min_lr=1e-6
-    )
+    # Set up the learning rate scheduler based on command line argument
+    if args.lr_schedule == 'onecycle':
+        # OneCycleLR is good for quick convergence with a large learning rate
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.learning_rate,
+            total_steps=args.epochs * (train_size // args.batch_size + 1),
+            pct_start=0.3,
+            div_factor=25.0,
+            final_div_factor=1e4
+        )
+        print("Using OneCycleLR scheduler")
+    elif args.lr_schedule == 'cosine':
+        # Import the TransformerLRScheduler for transformer-specific warming
+        from ..lr_scheduler import TransformerLRScheduler
+        
+        # Transformer models benefit from warmup to stabilize attention mechanisms
+        warmup_steps = min(1000, int(0.1 * args.epochs))  # 10% of epochs or 1000 max
+        scheduler = TransformerLRScheduler(
+            optimizer,
+            warmup_steps=warmup_steps,
+            d_model=config['transformer_dim'],
+            max_lr=args.learning_rate,
+            min_lr=1e-6
+        )
+        print(f"Using TransformerLRScheduler with {warmup_steps} warmup steps")
+    elif args.lr_schedule == 'reduce':
+        # ReduceLROnPlateau is good for adaptive learning rate adjustment
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=100,  # Wait 100 epochs before reducing LR
+            verbose=True,
+            min_lr=1e-6
+        )
+        print("Using ReduceLROnPlateau scheduler")
+    else:  # 'none' option
+        # No scheduler, use constant learning rate
+        scheduler = None
+        print("Using constant learning rate (no scheduler)")
     
     # Save transformation parameters for later use in inference
     transform_config_path = os.path.splitext(args.output)[0] + "_transform_config.json"
